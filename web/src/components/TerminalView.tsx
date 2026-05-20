@@ -27,15 +27,24 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         background: '#0d1117',
         foreground: '#c9d1d9',
         cursor: '#58a6ff',
-        selectionBackground: '#264f78',
+        selectionBackground: '#1f3a5f',
+        selectionForeground: '#c9d1d9',
         black: '#0d1117',
-        red: '#ff7b72',
-        green: '#3fb950',
-        yellow: '#d29922',
+        red: '#3d1a1a',
+        green: '#1a3d1a',
+        yellow: '#e3b341',
         blue: '#58a6ff',
-        magenta: '#bc8cff',
-        cyan: '#39d353',
+        magenta: '#d2a8ff',
+        cyan: '#76e3ea',
         white: '#c9d1d9',
+        brightBlack: '#484f58',
+        brightRed: '#ff7b72',
+        brightGreen: '#3fb950',
+        brightYellow: '#e3b341',
+        brightBlue: '#79c0ff',
+        brightMagenta: '#d2a8ff',
+        brightCyan: '#76e3ea',
+        brightWhite: '#f0f6fc',
       },
     })
 
@@ -56,7 +65,15 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
-        term.write(new Uint8Array(e.data))
+        let data = new Uint8Array(e.data)
+        // Remap Kiro's light diff background colors to darker equivalents
+        // so they're readable on a dark terminal background.
+        let str = new TextDecoder().decode(data)
+        str = str
+          .replace(/\x1b\[48;2;212;240;212m/g, '\x1b[48;2;30;60;30m')   // light green → dark green
+          .replace(/\x1b\[48;2;240;212;212m/g, '\x1b[48;2;60;25;25m')   // light pink → dark red
+          .replace(/\x1b\[48;2;238;238;238m/g, '\x1b[48;2;40;40;40m')   // light grey → dark grey
+        term.write(str)
       }
     }
 
