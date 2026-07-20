@@ -44,6 +44,8 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    list_all_terminals,
+    list_pending_receiver_ids_older_than,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -78,7 +80,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -473,6 +475,102 @@ def _reconcile_memory_at_startup() -> None:
             )
 
 
+def _reconcile_terminals_at_startup() -> None:
+    """Seed the StatusMonitor for terminals that have pending inbox messages.
+
+    When the CAO server restarts, the StatusMonitor loses its in-memory state.
+    Any terminal with PENDING inbox messages will never receive them because
+    deliver_pending() requires StatusMonitor to report IDLE/COMPLETED — but
+    the monitor returns UNKNOWN for all terminals it hasn't observed yet.
+
+    This function finds every terminal with pending messages, checks whether
+    its tmux pane is still alive, and probes the pane to seed an initial status.
+    The existing inbox_reconciliation_daemon then handles actual delivery once
+    the StatusMonitor has a non-UNKNOWN status for the terminal.
+
+    Best-effort: failures are logged and skipped, never blocking startup.
+    """
+    try:
+        from cli_agent_orchestrator.providers.manager import provider_manager
+
+        pending_ids = list_pending_receiver_ids_older_than(0)
+        if not pending_ids:
+            return
+
+        logger.info(
+            "Server restart detected %d terminal(s) with pending inbox messages — "
+            "seeding StatusMonitor",
+            len(pending_ids),
+        )
+        all_terminals = {t["id"]: t for t in list_all_terminals()}
+
+        for terminal_id in pending_ids:
+            try:
+                terminal = all_terminals.get(terminal_id)
+                if terminal is None:
+                    logger.debug(
+                        "Inbox recovery: terminal %s not in DB, skipping", terminal_id
+                    )
+                    continue
+
+                session = terminal.get("tmux_session")
+                window = terminal.get("tmux_window")
+                if not session or not window:
+                    logger.debug(
+                        "Inbox recovery: terminal %s missing session/window, skipping",
+                        terminal_id,
+                    )
+                    continue
+
+                # Check the pane is still alive before probing it.
+                try:
+                    from cli_agent_orchestrator.services.terminal_service import get_output, OutputMode
+                    pane_output = get_output(terminal_id, mode=OutputMode.FULL)
+                except Exception:
+                    logger.debug(
+                        "Inbox recovery: terminal %s pane not reachable, skipping",
+                        terminal_id,
+                    )
+                    continue
+
+                # Reconstruct a minimal provider so get_status() can parse the pane.
+                provider = provider_manager.get_provider(terminal_id)
+                if provider is None:
+                    # Provider wasn't re-registered (server restarted without the
+                    # terminal being recreated). Seed IDLE directly — the pane is
+                    # alive and the agent was idle when we last saw it.
+                    status_monitor._apply_detection(  # type: ignore[attr-defined]
+                        terminal_id, TerminalStatus.IDLE
+                    )
+                    logger.info(
+                        "Inbox recovery: seeded terminal %s as IDLE (no provider)",
+                        terminal_id,
+                    )
+                else:
+                    detected = provider.get_status(pane_output)
+                    if detected in (TerminalStatus.UNKNOWN, TerminalStatus.PROCESSING):
+                        # Pane is alive but we can't confirm IDLE — default to IDLE
+                        # so delivery is attempted. Worst case: message arrives while
+                        # agent is briefly processing; kiro queues it.
+                        detected = TerminalStatus.IDLE
+                    status_monitor._apply_detection(  # type: ignore[attr-defined]
+                        terminal_id, detected
+                    )
+                    logger.info(
+                        "Inbox recovery: seeded terminal %s as %s",
+                        terminal_id,
+                        detected.value,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Inbox recovery: failed to seed terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
+    except Exception as exc:
+        logger.warning("Inbox recovery at startup failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -491,6 +589,7 @@ async def lifespan(app: FastAPI):
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
     _reconcile_memory_at_startup()
+    _reconcile_terminals_at_startup()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
