@@ -51,6 +51,32 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
+    # Kiro CLI maps CAO vocabulary to kiro's capability tag names, which are
+    # passed to --trust-tools on launch. Only tags in this list are pre-approved;
+    # anything not listed is hard-denied by kiro (no approval prompt) when the
+    # agent runs under --v3 with permissions.yaml, or simply never offered as a
+    # trusted tool in v2. Tags match kiro's --trust-tools accepted values exactly.
+    #
+    # Kiro tag → kiro capability:
+    #   read    → fs_read  (file reading, directory listing, searching)
+    #   write   → fs_write (file writing, editing, deleting)
+    #   shell   → shell    (command execution)
+    #   web     → web_fetch + web_search
+    #
+    # Note: MCP tool calls (@cao-mcp-server) are controlled via the mcp capability
+    # in permissions.yaml and are always allowed for orchestration; they are NOT
+    # passed via --trust-tools (kiro auto-approves trusted MCP servers separately).
+    "kiro_cli": {
+        "fs_read": ["read"],
+        "fs_write": ["write"],
+        "fs_list": ["read"],   # kiro's "read" tag covers listing/searching too
+        "fs_*": ["read", "write"],
+        "execute_bash": ["shell"],
+        "shell": ["shell"],
+        "web_fetch": ["web"],
+        "grep": ["read"],
+        "glob": ["read"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
@@ -189,3 +215,39 @@ def format_tool_summary(allowed: List[str]) -> str:
     if "*" in allowed:
         return "ALL TOOLS (unrestricted)"
     return ", ".join(allowed)
+
+
+def get_kiro_trust_tools(allowed: List[str]) -> str | None:
+    """Translate a CAO allowedTools list into a --trust-tools CSV string for kiro-cli.
+
+    Maps CAO tool vocabulary to kiro capability tag names. Returns None when the
+    allowed list is unrestricted ("*") — caller should use --trust-all-tools instead.
+    Returns an empty string when no mappable tools are found (trust nothing).
+
+    Args:
+        allowed: CAO allowedTools list from the agent profile
+
+    Returns:
+        Comma-separated kiro tag string (e.g. "read,write,shell"), "" for none, or
+        None for unrestricted ("*").
+
+    Example:
+        get_kiro_trust_tools(["fs_*", "shell", "@cao-mcp-server"]) -> "read,write,shell"
+    """
+    if "*" in allowed:
+        return None  # caller uses --trust-all-tools
+
+    mapping = TOOL_MAPPING.get("kiro_cli", {})
+    tags: List[str] = []
+    seen: set = set()
+    for cao_tool in allowed:
+        if cao_tool.startswith("@"):
+            # MCP server references — not passed via --trust-tools
+            continue
+        native_tags = mapping.get(cao_tool, [])
+        for tag in native_tags:
+            if tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+
+    return ",".join(tags)

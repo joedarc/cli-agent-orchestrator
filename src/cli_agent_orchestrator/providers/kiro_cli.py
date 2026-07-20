@@ -294,7 +294,32 @@ class KiroCliProvider(BaseProvider):
             )
             base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
         else:
+            # Non-yolo: pass --trust-tools=<tags> derived from the agent's
+            # allowedTools so kiro pre-approves exactly those capabilities and
+            # hard-denies everything else (no hanging approval prompts).
+            # Falls back gracefully: if no mapping exists the flag is omitted
+            # and behaviour is identical to the previous default.
+            from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
+
             base_args = ["kiro-cli", "chat"]
+
+            # --v3: opt-in to the kiro v3 engine, which makes permissions.yaml
+            # deny rules hard engine-level enforcement rather than advisory.
+            # Enabled via kiro_use_v3=true in CAO settings.json.
+            use_v3 = bool(get_server_settings().get("kiro_use_v3", False))
+            if use_v3:
+                logger.info("kiro_cli: launching with --v3 engine (kiro_use_v3=true)")
+                base_args.append("--v3")
+
+            if self._allowed_tools:
+                trust_tags = get_kiro_trust_tools(self._allowed_tools)
+                if trust_tags is not None:
+                    # trust_tags is "" when no mappable tools — pass empty string
+                    # to kiro so it trusts nothing (hard-deny all without prompts).
+                    base_args.extend(["--trust-tools", trust_tags])
+                    logger.info(
+                        "kiro_cli: launching with --trust-tools=%s", trust_tags or "(none)"
+                    )
         if model:
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
