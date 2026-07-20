@@ -306,7 +306,8 @@ class KiroCliProvider(BaseProvider):
             # --v3: opt-in to the kiro v3 engine, which makes permissions.yaml
             # deny rules hard engine-level enforcement rather than advisory.
             # Enabled via kiro_use_v3=true in CAO settings.json.
-            use_v3 = bool(get_server_settings().get("kiro_use_v3", False))
+            from cli_agent_orchestrator.services.settings_service import _load as _load_settings
+            use_v3 = bool(_load_settings().get("kiro_use_v3", False))
             if use_v3:
                 logger.info("kiro_cli: launching with --v3 engine (kiro_use_v3=true)")
                 base_args.append("--v3")
