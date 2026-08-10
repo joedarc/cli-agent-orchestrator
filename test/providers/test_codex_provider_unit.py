@@ -1,14 +1,19 @@
 """Unit tests for Codex provider."""
 
+import os
+import re
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
+    _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
 )
@@ -19,6 +24,17 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
+
+
+def read_developer_instructions_file(command: str) -> str:
+    """Extracts the path from the command's ``$(cat <path>)`` developer_instructions
+    fragment and returns that file's actual on-disk content -- the fragment keeps the
+    launch line itself short (see codex.py's own long comment at the assignment site),
+    so tests that need to check the actual (TOML-escaped) prompt text now read it from
+    here instead of asserting on ``command`` directly."""
+    match = re.search(r"\$\(cat (\S+)\)", command)
+    assert match is not None, f"no $(cat <file>) developer_instructions fragment in: {command!r}"
+    return Path(match.group(1)).read_text(encoding="utf-8")
 
 
 class TestCodexProviderInitialization:
@@ -42,7 +58,8 @@ class TestCodexProviderInitialization:
         mock_tmux.return_value.send_keys.assert_any_call(
             "test-session",
             "window-0",
-            "codex --yolo --no-alt-screen --disable shell_snapshot",
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false",
         )
         mock_wait_status.assert_called_once()
 
@@ -76,10 +93,13 @@ class TestCodexBuildCommand:
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == (
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_with_skill_prompt(self, mock_load_profile):
+    def test_build_command_with_skill_prompt(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
@@ -94,15 +114,17 @@ class TestCodexBuildCommand:
             "code_supervisor",
             skill_prompt="## Available Skills\n- **python-testing**: Pytest",
         )
-        command = provider._build_codex_command()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
 
         mock_load_profile.assert_called_once_with("code_supervisor")
-        assert "developer_instructions=" in command
-        assert "## Available Skills" in command
-        assert "python-testing" in command
+        assert "developer_instructions=$(cat " in command
+        instructions = read_developer_instructions_file(command)
+        assert "## Available Skills" in instructions
+        assert "python-testing" in instructions
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_with_agent_profile(self, mock_load_profile):
+    def test_build_command_with_agent_profile(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a code supervisor agent."
@@ -111,16 +133,17 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
-        command = provider._build_codex_command()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
 
         mock_load_profile.assert_called_once_with("code_supervisor")
         assert "codex --yolo --no-alt-screen --disable shell_snapshot" in command
         assert "-c" in command
-        assert "developer_instructions=" in command
-        assert "You are a code supervisor agent." in command
+        assert "developer_instructions=$(cat " in command
+        assert "You are a code supervisor agent." in read_developer_instructions_file(command)
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_escapes_quotes(self, mock_load_profile):
+    def test_build_command_escapes_quotes(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = 'Use "double quotes" carefully.'
@@ -129,12 +152,13 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
-        command = provider._build_codex_command()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
 
-        assert '\\"double quotes\\"' in command
+        assert '\\"double quotes\\"' in read_developer_instructions_file(command)
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_escapes_newlines(self, mock_load_profile):
+    def test_build_command_escapes_newlines(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "Line one.\nLine two.\n\n## Section\n- Item"
@@ -143,18 +167,32 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
-        command = provider._build_codex_command()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
 
-        # Literal newlines must be escaped to \n for TOML and tmux compatibility
+        # The launch line itself must never contain a literal newline (that's the whole point
+        # of this fix -- see the long comment at the fragment's assignment site in codex.py) OR
+        # any of the actual prompt text; both now live only in the temp file.
         assert "\n" not in command
-        assert "\\n" in command
-        assert "Line one.\\nLine two.\\n\\n## Section\\n- Item" in command
+        assert "Line one." not in command
+
+        # Literal newlines in the prompt must be escaped to \n for TOML and tmux compatibility,
+        # in the temp file's own content.
+        instructions = read_developer_instructions_file(command)
+        assert "\n" not in instructions
+        assert "\\n" in instructions
+        assert "Line one.\\nLine two.\\n\\n## Section\\n- Item" in instructions
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- these assertions only care about the MCP -c overrides, not the
+        # developer_instructions temp file, so there's nothing to gain from writing
+        # one to disk (and every write outside a patched CAO_HOME_DIR touches the
+        # real ~/.aws/cli-agent-orchestrator/tmp/, same convention as
+        # test_build_command_with_mcp_servers_env below).
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {
                 "type": "stdio",
@@ -185,7 +223,8 @@ class TestCodexBuildCommand:
         before being emitted as a -c override."""
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- see test_build_command_with_mcp_servers's comment above.
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }
@@ -212,7 +251,8 @@ class TestCodexBuildCommand:
         -c override stays a valid TOML basic string."""
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- see test_build_command_with_mcp_servers's comment above.
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }
@@ -347,7 +387,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == (
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false"
+        )
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -362,7 +405,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == (
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
@@ -379,7 +425,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, tmp_path
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -392,13 +438,14 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
-        result = await provider.initialize()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            result = await provider.initialize()
 
         assert result is True
         # The second send_keys call should contain developer_instructions
         codex_call = mock_tmux.return_value.send_keys.call_args_list[1]
-        assert "developer_instructions=" in codex_call.args[2]
-        assert "You are a supervisor." in codex_call.args[2]
+        assert "developer_instructions=$(cat " in codex_call.args[2]
+        assert "You are a supervisor." in read_developer_instructions_file(codex_call.args[2])
 
 
 class TestCodexProviderModelFlag:
@@ -432,13 +479,34 @@ class TestCodexProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_codex_command()
+
+        assert "--model fable-5" in command
+        assert "--model gpt-5" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        provider = CodexProvider("tid", "sess", "win", None, model="fable-5")
+        command = provider._build_codex_command()
+
+        assert "--model fable-5" in command
+
 
 class TestCodexBuildCommandExtra:
     """Coverage for branches inside ``_build_codex_command`` that the
     pre-existing fixtures didn't exercise."""
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_security_prompt_prepended_when_tools_restricted(self, mock_load):
+    def test_security_prompt_prepended_when_tools_restricted(self, mock_load, tmp_path):
         # When ``allowed_tools`` is a restricted set (no "*"), the provider
         # prepends SECURITY_PROMPT plus a "You only have access to these
         # tools:" hint to the developer_instructions payload.
@@ -452,13 +520,98 @@ class TestCodexBuildCommandExtra:
         provider = CodexProvider(
             "tid", "sess", "win", "agent", allowed_tools=["fs_read", "fs_list"]
         )
-        command = provider._build_codex_command()
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
 
-        assert "You only have access to these tools: fs_read, fs_list" in command
-        assert "Original system prompt." in command
+        instructions = read_developer_instructions_file(command)
+        assert "You only have access to these tools: fs_read, fs_list" in instructions
+        assert "Original system prompt." in instructions
         # SECURITY_PROMPT lives in constants; assert on a stable substring
         # rather than importing the constant into the test fixture.
-        assert "NEVER" in command  # "NEVER read/output: ~/.aws/credentials..."
+        assert "NEVER" in instructions  # "NEVER read/output: ~/.aws/credentials..."
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_long_system_prompt_keeps_launch_line_short(self, mock_load, tmp_path):
+        """Regression test for the real, live-reproduced failure: a large system_prompt
+        (harness-control's own injected operating instructions + skill list commonly produce
+        several KB once escaped) used to be inlined directly into the launch command via
+        ``-c developer_instructions="<escaped text>"``. When that pane is still a bare shell
+        (codex has not started yet -- correctly NOT given bracketed-paste framing, since a bare
+        shell does not understand those escape sequences), a single typed/pasted line beyond the
+        tty's canonical-mode line-length limit (MAX_CANON, 4096 bytes on Linux) is silently
+        truncated by the kernel's tty line discipline before the shell ever sees a complete,
+        valid command -- the shell hangs at an unclosed-quote continuation prompt forever, no
+        codex process is ever spawned, and CAO's own init-timeout eventually fires with a
+        generic "Codex initialization timed out" that gives no hint of the real cause.
+
+        Confirmed live (isolated scratch tmux pane, zero risk to any other session): an 8.3KB
+        escaped instructions payload, sent via CAO's own real send_keys code path to a real bare
+        shell pane, never executed even after an explicit trailing Enter (verified with a
+        marker-file test) -- while `dash -n`/`bash -n` on the exact same text as a plain script
+        confirmed the content itself was syntactically valid, ruling out a quoting bug and
+        pointing squarely at line length as the real, sole cause."""
+        long_prompt = "A" * 10_000  # escapes to something well over the 4096-byte MAX_CANON limit
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = long_prompt
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
+
+        # The actual typed/pasted launch line must stay well under the tty's canonical-mode
+        # line-length limit regardless of how long the instructions text is -- this is the
+        # entire point of the fix. 1000 is a generous margin under the real 4096-byte limit.
+        assert len(command) < 1000, (
+            f"launch line is {len(command)} bytes -- long enough to risk the tty canonical-mode "
+            "line-length limit this fix exists to avoid"
+        )
+        assert long_prompt not in command
+        assert "developer_instructions=$(cat " in command
+        assert long_prompt in read_developer_instructions_file(command)
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_developer_instructions_file_written_with_owner_only_permissions(
+        self, mock_load, tmp_path
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Sensitive: contains real secrets context."
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
+
+        match = re.search(r"\$\(cat (\S+)\)", command)
+        assert match is not None
+        file_path = Path(match.group(1))
+        assert oct(file_path.stat().st_mode)[-3:] == "600"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_cleanup_removes_developer_instructions_file(self, mock_load, tmp_path):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Some instructions."
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
+            match = re.search(r"\$\(cat (\S+)\)", command)
+            assert match is not None
+            file_path = Path(match.group(1))
+            assert file_path.exists()
+
+            provider.cleanup()
+            assert not file_path.exists()
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_mcp_server_accepts_model_instance(self, mock_load):
@@ -715,7 +868,10 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == (
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_empty_dict_emits_no_overrides(self, mock_load):
@@ -730,7 +886,10 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == (
+            "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " -c check_for_update_on_startup=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_composes_with_mcp_and_model(self, mock_load):
@@ -941,6 +1100,86 @@ class TestCodexProviderStatusDetection:
         status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
+
+
+class TestCodexRenderedScreenStatusDetection:
+    """Regression coverage for in-place Codex TUI redraws.
+
+    ``tmux pipe-pane`` is append-only: text erased from the visible terminal
+    remains in CAO's raw rolling buffer.  MCP startup uses the same spinner
+    shape as a live agent turn, so raw parsing can remain PROCESSING forever
+    after the visible screen has returned to the idle composer.
+    """
+
+    def test_provider_opts_into_rendered_screen_detection(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.supports_screen_detection is True
+
+    def test_blank_rendered_screen_is_unknown(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(["", "   "]) == TerminalStatus.UNKNOWN
+
+    def test_overwritten_mcp_startup_spinner_does_not_pin_processing(self):
+        import pyte
+
+        raw = (
+            "\x1b[1;1H• Starting MCP servers (0/3): cao-mcp-server"
+            " (0s • esc to interrupt)"
+            "\x1b[3;1H› Improve documentation in @filename"
+            "\x1b[5;1H  gpt-5.6-terra high · /tmp/project"
+            # Codex clears the transient activity row once MCP startup settles.
+            "\x1b[1;1H\x1b[2K"
+        )
+        screen = pyte.Screen(200, 20)
+        pyte.Stream(screen).feed(raw)
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        # Demonstrate the old failure mode: stripping cursor controls from the
+        # append-only stream leaves the erased spinner behind.
+        assert provider.get_status(raw) == TerminalStatus.PROCESSING
+        # The composited viewport contains only the live idle composer.
+        assert provider.get_status_from_screen(list(screen.display)) == TerminalStatus.IDLE
+
+    def test_live_mcp_startup_spinner_is_processing(self):
+        screen_lines = [
+            "• Starting MCP servers (1/3): cao-mcp-server (0s • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("elapsed", ["1m 00s", "1h 00m 00s"])
+    def test_minute_plus_live_progress_is_processing(self, elapsed):
+        screen_lines = [
+            "› Implement the requested feature",
+            f"• Working ({elapsed} • esc to interrupt)",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
+    def test_completed_turn_on_rendered_screen_is_completed(self):
+        screen_lines = [
+            "› Reply with the readiness token",
+            "• CAO_CODEX_READY",
+            "",
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status_from_screen(screen_lines) == TerminalStatus.COMPLETED
 
 
 class TestCodexBulletFormatStatusDetection:
@@ -1620,6 +1859,146 @@ class TestCodexProviderMisc:
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
 
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "Explain this codebase",
+            "Summarize recent commits",
+            "Implement {feature}",
+            "Find and fix a bug in @filename",
+            "Write tests for @filename",
+            "Improve documentation in @filename",
+            "Run /review on my current changes",
+            "Use /skills to list available skills",
+        ],
+    )
+    def test_v0145_idle_composer_placeholders(self, placeholder):
+        output = (
+            f"OpenAI Codex (v0.145.0)\n› {placeholder}\n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_returns_on_v0145_idle_composer(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        """Codex 0.145's placeholder composer is a ready state, not a timeout."""
+        mock_backend.return_value.get_history.return_value = load_fixture(
+            "codex_v0145_idle_output.txt"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_backend.return_value.get_history.assert_called_once()
+        mock_sleep.assert_not_awaited()
+        mock_error.assert_not_called()
+        mock_backend.return_value.send_keys.assert_not_called()
+        mock_backend.return_value.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 1.0, 2.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_waits_for_complete_v0145_composer_frame(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        """Chunked redraws are not ready until composer and footer are both visible."""
+        fixture = load_fixture("codex_v0145_idle_output.txt")
+        mock_backend.return_value.get_history.side_effect = [
+            "OpenAI Codex (v0.145.0)\n",
+            "OpenAI Codex (v0.145.0)\n› Write tests for @filename\n",
+            fixture,
+            "timeout tail",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        assert mock_backend.return_value.get_history.call_count == 3
+        assert mock_sleep.await_count == 2
+        mock_error.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            (
+                "› Fix the failing tests\n"
+                "• Working (2s • esc to interrupt)\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "› Fix the failing tests\n"
+                "• Working\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "Approve this command? [y/n]\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+                "╭─ Command Approval Required ─╮\n"
+                "│ [a] Accept  [d] Decline     │\n"
+                "╰─────────────────────────────╯\n"
+            ),
+            ("› fix the failing tests\n" "  gpt-5.6-sol medium · Context 100% left\n"),
+            "OpenAI Codex (v0.145.0)\nLoading project instructions\n",
+            (
+                "The docs show › Write tests for @filename as an example.\n"
+                "This is not a Codex footer: Context 100% left\n"
+            ),
+            "› \nold output\n\nstill running\n\nlatest output\n",
+        ],
+        ids=[
+            "working",
+            "partial-working-frame",
+            "approval",
+            "boxed-approval",
+            "typed-draft",
+            "ordinary-output",
+            "similar-strings",
+            "stale-legacy-prompt",
+        ],
+    )
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_does_not_treat_non_ready_output_as_idle(
+        self, mock_backend, mock_error, mock_sleep, _mock_time, output
+    ):
+        mock_backend.return_value.get_history.return_value = output
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_sleep.assert_awaited_once_with(1.0)
+        mock_error.assert_called_once()
+        mock_backend.return_value.send_keys.assert_not_called()
+        mock_backend.return_value.send_special_key.assert_not_called()
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
@@ -1685,3 +2064,637 @@ class TestCodexProviderTrustPrompt:
         mock_tmux.return_value.send_special_key.assert_called_with(
             "test-session", "window-0", "Enter"
         )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_with_trust_prompt_v2(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """Test that initialize handles v2 trust prompt (git worktree variant)."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = (
+            "Note: You're in a subdirectory of a Git project. Trusting will apply\n"
+            "to the repository root: /Users/test/project\n"
+            "\n"
+            "Do you trust the contents of this directory?\n"
+            "\n"
+            "› 1. Yes, continue\n"
+            "  2. No, quit\n"
+            "\n"
+            "Press enter to continue\n"
+        )
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        result = await provider.initialize()
+
+        assert result is True
+        mock_tmux.return_value.send_special_key.assert_called_with(
+            "test-session", "window-0", "Enter"
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_prompt_v2_is_waiting(self, mock_backend):
+        """V2 trust dialog in bottom region classifies WAITING_USER_ANSWER."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "Note: You're in a subdirectory of a Git project.\n"
+            "Trusting will apply to the repository root: /Users/test/project\n"
+            "\n"
+            "Do you trust the contents of this directory?\n"
+            "\n"
+            "› 1. Yes, continue\n"
+            "  2. No, quit\n"
+            "\n"
+            "Press enter to continue\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_v2_in_scrollback_does_not_false_positive(self, mock_backend):
+        """V2 trust text in scrollback (not bottom) must NOT trigger WAITING."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "› explain trust prompts\n"
+            '• The dialog says "Do you trust the contents of this directory?"\n'
+            "• and shows options like Yes/No.\n"
+            "\n"
+            "• Here's more explanation about how it works.\n"
+            "• The trust system is directory-based.\n"
+            "• It remembers your choice for future sessions.\n"
+            "• You can reset trust settings in ~/.codex/config.toml.\n"
+            "• Each project root has its own trust state.\n"
+            "• Subdirectories inherit the parent trust level.\n"
+            "• Git worktrees prompt separately from the main repo.\n"
+            "• You can pre-trust with --full-auto flag.\n"
+            "• The dialog only shows on first visit to a new directory.\n"
+            "• Once trusted, Codex won't ask again.\n"
+            "• The trust prompt has two variants depending on version.\n"
+            "• Newer versions use the git-aware prompt.\n"
+            "\n"
+            "› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        # Should be COMPLETED (model replied to user question), NOT WAITING
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_login_menu_is_waiting(self, mock_backend):
+        """First-run auth menu (no credentials configured) in the bottom region
+        classifies WAITING_USER_ANSWER -- live-reproduced real Codex output."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "  Welcome to Codex, OpenAI's command-line coding agent\n"
+            "\n"
+            "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+            "  or connect an API key for usage-based billing\n"
+            "\n"
+            "> 1. Sign in with ChatGPT\n"
+            "     Usage included with Plus, Pro, Business, and Enterprise plans\n"
+            "\n"
+            "  2. Sign in with Device Code\n"
+            "     Sign in from another device with a one-time code\n"
+            "\n"
+            "  3. Provide your own API key\n"
+            "     Pay for what you use\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_login_menu_in_scrollback_does_not_false_positive(self, mock_backend):
+        """Login-menu text in scrollback (not the bottom region) must NOT trigger WAITING --
+        same bottom-anchoring discipline as the V2 trust dialog check immediately above."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "› explain the codex login menu\n"
+            '• Earlier it showed "Sign in with ChatGPT to use Codex as part of your paid plan".\n'
+            "• That happens on first run with no credentials configured.\n"
+            "• There were three options: ChatGPT, Device Code, or an API key.\n"
+            "• Once authenticated, this menu never shows again.\n"
+            "• You can re-trigger it with codex logout.\n"
+            "• The credentials get stored in ~/.codex/auth.json.\n"
+            "• API keys are validated on first use, not at login time.\n"
+            "• Device code login works well for headless environments.\n"
+            "• ChatGPT login opens a browser tab for OAuth.\n"
+            "• Both paths end up writing the same auth.json format.\n"
+            "• You can check current auth status with codex login status.\n"
+            "• Logging out clears the stored credentials entirely.\n"
+            "• None of this appears again once you're signed in.\n"
+            "• This whole explanation is well past fifteen lines by now.\n"
+            "• Padding further to push the earlier mention out of the tail window.\n"
+            "\n"
+            "› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_includes_waiting_user_answer_in_target_status(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """Regression test for the real, live-reproduced failure: an account with no
+        credentials configured yet reaches a correctly-rendered, fully-alive login screen
+        that never becomes IDLE/COMPLETED on its own -- initialize()'s own
+        wait_until_status(..., {IDLE, COMPLETED}, ...) target set had no way to ever
+        succeed for it, so CAO tore the terminal down on every single attempt (a live,
+        reproduced "Codex initialization timed out after 60 seconds", the operator's own
+        "the session doesn't even start" symptom) before anyone had a real chance to open
+        the session and complete login. WAITING_USER_ANSWER must be in the target set."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        result = await provider.initialize()
+
+        assert result is True
+        target_status_arg = mock_wait_status.call_args.args[1]
+        assert TerminalStatus.WAITING_USER_ANSWER in target_status_arg
+        assert TerminalStatus.IDLE in target_status_arg
+        assert TerminalStatus.COMPLETED in target_status_arg
+
+    def test_backend_registry_is_clean_at_test_start(self):
+        """Regression for #522: autouse fixture resets the backend singleton."""
+        from cli_agent_orchestrator.backends import registry
+
+        assert registry._backend is None, (
+            "Backend singleton leaked from a prior test — "
+            "_reset_backend_registry fixture is not working"
+        )
+
+
+class TestCodexProviderUpdateDialog:
+    """Tests for Codex update-available dialog handling."""
+
+    def test_get_status_update_dialog_waiting(self):
+        """Active update dialog classifies as WAITING_USER_ANSWER."""
+        output = load_fixture("codex_update_dialog.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_update_dialog_in_scrollback_is_idle(self):
+        """After update dialog is dismissed, status returns to IDLE (not stuck WAITING)."""
+        output = load_fixture("codex_update_dialog_scrollback.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.IDLE
+
+    def test_get_status_update_dialog_scrollback_with_padding(self):
+        """Update text in scrollback far above the bottom region must not false-positive."""
+        output = (
+            "Update available! 0.142.5 -> 0.144.5\n"
+            "1. Update now (runs npm install -g @openai/codex)\n"
+            "2. Skip\n"
+            "3. Skip until next version\n"
+            "Press enter to continue\n"
+            "› summarize the startup dialog\n"
+            "• The update prompt had three choices and was skipped.\n"
+            "• It is no longer active once the TUI returns to the prompt.\n"
+            "• Padding line 1.\n"
+            "• Padding line 2.\n"
+            "• Padding line 3.\n"
+            "• Padding line 4.\n"
+            "• Padding line 5.\n"
+            "• Padding line 6.\n"
+            "• Padding line 7.\n"
+            "• Padding line 8.\n"
+            "• Padding line 9.\n"
+            "• Padding line 10.\n"
+            "• Done.\n"
+            "\n"
+            "› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_dismisses_update_dialog(self, mock_tmux):
+        """_handle_trust_prompt detects update dialog and selects '3'+Enter."""
+        mock_tmux.return_value.get_history.side_effect = [
+            (
+                "✨ Update available! 0.142.5 -> 0.144.5\n"
+                "1. Update now (runs npm install -g @openai/codex)\n"
+                "2. Skip\n"
+                "3. Skip until next version\n"
+                "Press enter to continue\n"
+            ),
+            "OpenAI Codex (v0.142.5)\n› ",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=5.0)
+
+        mock_tmux.return_value.send_keys.assert_any_call(
+            "test-session", "window-0", "3", enter_count=0
+        )
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_no_update_dialog(self, mock_tmux):
+        """Normal startup (no dialog) must not trigger any dismissal keystrokes."""
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.142.5)\n› "
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=2.0)
+
+        mock_tmux.return_value.send_keys.assert_not_called()
+        mock_tmux.return_value.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_dismisses_update_dialog(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """initialize() sees the update dialog, sends '3'+Enter, then reaches ready."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.side_effect = [
+            (
+                "OpenAI Codex (v0.142.5)\n"
+                "✨ Update available! 0.142.5 -> 0.144.5\n"
+                "1. Update now (runs npm install -g @openai/codex)\n"
+                "2. Skip\n"
+                "3. Skip until next version\n"
+                "Press enter to continue\n"
+            ),
+            "OpenAI Codex (v0.142.5)\n› ",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        result = await provider.initialize()
+
+        assert result is True
+        mock_tmux.return_value.send_keys.assert_any_call(
+            "test-session", "window-0", "3", enter_count=0
+        )
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+        mock_wait_status.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_then_late_update_dialog(self, mock_tmux):
+        """Multi-frame: trust dismissed → transitional banner (no dialog yet) → update dialog → dismissed."""
+        # Frame 1: trust prompt visible
+        frame_trust = (
+            "Note: You're in a subdirectory of a Git project. Trusting will apply\n"
+            "to the repository root: /Users/test/project\n"
+            "\n"
+            "Do you trust the contents of this directory?\n"
+            "\n"
+            "› 1. Yes, continue\n"
+            "  2. No, quit\n"
+            "\n"
+            "Press enter to continue\n"
+        )
+        # Frame 2: trust dismissed, welcome banner visible but NO idle prompt yet
+        # (transitional state before update dialog renders)
+        frame_transitional = "OpenAI Codex (v0.142.5)\n"
+        # Frame 3: update dialog renders
+        frame_update = (
+            "OpenAI Codex (v0.142.5)\n"
+            "✨ Update available! 0.142.5 -> 0.144.5\n"
+            "1. Update now (runs npm install -g @openai/codex)\n"
+            "2. Skip\n"
+            "3. Skip until next version\n"
+            "Press enter to continue\n"
+        )
+        # Frame 4: update dismissed, idle prompt visible
+        frame_idle = "OpenAI Codex (v0.142.5)\n› "
+
+        mock_tmux.return_value.get_history.side_effect = [
+            frame_trust,
+            frame_transitional,
+            frame_update,
+            frame_idle,
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=10.0)
+
+        # Trust was dismissed with Enter
+        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+        # Update dialog was dismissed with '3' then Enter
+        mock_tmux.return_value.send_keys.assert_any_call(
+            "test-session", "window-0", "3", enter_count=0
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_update_check_suppression_is_last_override(self, mock_load):
+        """CAO's update suppression must win even if a profile sets the key."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"check_for_update_on_startup": True}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "check_for_update_on_startup=true" in command
+        assert command.endswith("-c check_for_update_on_startup=false")
+
+
+class TestCodexProviderUpdateDialogLive:
+    """Live binary tests for update dialog config key. Requires CAO_RUN_LIVE_PROVIDER_TESTS=1."""
+
+    @pytest.mark.skipif(
+        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
+        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
+    )
+    def test_check_for_update_on_startup_accepted_by_binary(self):
+        """check_for_update_on_startup is a recognized config key under --strict-config."""
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_home:
+            env = {**os.environ, "CODEX_HOME": tmp_home}
+            result = subprocess.run(
+                [
+                    "codex",
+                    "--strict-config",
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "echo hi",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=env,
+            )
+            combined = result.stdout + result.stderr
+            assert (
+                "unknown" not in combined.lower() or "configuration field" not in combined.lower()
+            )
+
+    @pytest.mark.skipif(
+        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
+        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
+    )
+    def test_bogus_config_key_rejected_negative_control(self):
+        """Negative control: a bogus key IS rejected under --strict-config."""
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_home:
+            env = {**os.environ, "CODEX_HOME": tmp_home}
+            result = subprocess.run(
+                [
+                    "codex",
+                    "--strict-config",
+                    "-c",
+                    "this_key_does_not_exist_xyz_cao_probe=true",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "echo hi",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=env,
+            )
+            combined = result.stdout + result.stderr
+            assert "unknown configuration field" in combined.lower()
+
+
+class TestCodexProviderExitDetection:
+    """Tests for detecting when the codex process has exited."""
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_error_when_provider_exited(self, mock_tmux):
+        """ERROR when pane command reverts to shell (codex process exited)."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        output = "OpenAI Codex (v0.98.0)\n› \n% \n"
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_normal_when_codex_running(self, mock_tmux):
+        """Normal status detection when codex is still running (pane command != shell)."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "codex"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        output = (
+            "OpenAI Codex (v0.98.0)\n"
+            "› \n"
+            "  ? for shortcuts                     100% context left\n"
+        )
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_skips_exit_check_before_init(self, mock_tmux):
+        """Exit check skipped before initialization (avoids false ERROR on launch)."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = False
+        provider.shell_baseline = "zsh"
+        output = "OpenAI Codex (v0.98.0)\n› \n"
+        status = provider.get_status(output)
+
+        # Should NOT be ERROR — exit check gated on _initialized
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_skips_exit_check_without_baseline(self, mock_tmux):
+        """Exit check skipped when no shell_baseline was captured."""
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = None
+        output = "OpenAI Codex (v0.98.0)\n› \n"
+        status = provider.get_status(output)
+
+        # Should NOT be ERROR — no baseline to compare against
+        assert status == TerminalStatus.IDLE
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_captures_shell_baseline(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """Initialize captures shell_baseline for exit detection."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider.initialize()
+
+        assert provider.shell_baseline == "zsh"
+        mock_tmux.return_value.get_pane_current_command.assert_called_with(
+            "test-session", "window-0"
+        )
+
+
+class TestCodexLaunchFlagsValidity:
+    """Validate that all flags in the codex launch command are accepted by the binary.
+
+    Gated behind CAO_RUN_LIVE_PROVIDER_TESTS=1 since it invokes the real codex binary.
+    """
+
+    @pytest.mark.skipif(
+        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
+        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
+    )
+    def test_codex_launch_flags_are_valid(self):
+        """Every flag in the default launch command must be accepted by codex."""
+        import subprocess
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        command = provider._build_codex_command()
+        parts = shlex.split(command)
+
+        # Extract flags (anything starting with -)
+        flags = [p for p in parts if p.startswith("-")]
+        assert flags, "Expected flags in codex launch command"
+
+        # Get codex help to validate flags exist
+        help_result = subprocess.run(
+            ["codex", "--help"], capture_output=True, text=True, timeout=10
+        )
+        help_text = help_result.stdout + help_result.stderr
+
+        for flag in flags:
+            flag_name = flag.lstrip("-").split("=")[0]
+            if flag_name in help_text or f"--{flag_name}" in help_text:
+                continue
+            # Hidden aliases (e.g. --yolo) don't appear in --help; probe the
+            # binary directly — an unknown flag makes clap exit non-zero with
+            # "unexpected argument".
+            probe = subprocess.run(
+                ["codex", flag, "--help"], capture_output=True, text=True, timeout=10
+            )
+            assert (
+                probe.returncode == 0 and "unexpected argument" not in probe.stderr
+            ), f"Flag '{flag}' in launch command rejected by codex binary"
+
+
+class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
+    """PR #540 follow-up (raised during the round-2 review pass): CodexProvider must
+    opt into `blocks_orchestrated_input_while_waiting_user_answer` -- otherwise, now
+    that `initialize()` accepts WAITING_USER_ANSWER (the first-run login menu) as a
+    success outcome, an assign/handoff's deferred-init `send_input` would paste the
+    orchestrated task straight into the live login menu instead of being held for
+    `answer_user_prompt`. Same hazard PR #539's review flagged for ClaudeCodeProvider,
+    fixed here the same way (a property override matching hermes.py/antigravity_cli.py).
+    """
+
+    def test_property_is_true(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_waiting_on_login_menu_leaves_worker_alive_task_undelivered(
+        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, mock_notify
+    ):
+        """RED (pre-fix, property False): send_input's guard no-ops, the task text
+        is pasted into the live login menu via `send_keys`, and the deferred-init
+        path treats delivery as having succeeded -- `_notify_caller_of_deferred_failure`
+        is never called at all, so this test's own assertion of a undelivered/alive
+        worker fails outright (no call to assert on).
+        GREEN (post-fix, property True): `send_input` raises `TerminalInputBlockedError`
+        before any `send_keys` call, `_schedule_deferred_init` catches it and leaves the
+        worker alive (`delete_worker=False`) with nothing pasted.
+        """
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {
+            "caller_id": "super123",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        # Real provider instance (not a generic mock) so its actual
+        # blocks_orchestrated_input_while_waiting_user_answer property value is
+        # what send_input's guard consults -- this is the thing under test.
+        real_provider = CodexProvider("worker99", "cao-session", "developer-abcd")
+        mock_pm.get_provider.return_value = real_provider
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True  # succeeded: WAITING_USER_ANSWER reached
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.kwargs["delete_worker"] is False

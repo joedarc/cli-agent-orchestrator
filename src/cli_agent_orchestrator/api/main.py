@@ -14,7 +14,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -39,13 +39,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
-    list_all_terminals,
-    list_pending_receiver_ids_older_than,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -55,33 +54,45 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    MODEL_ID_MAX_LEN,
+    MODEL_ID_RE,
     OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WORKFLOW_ENV_ALLOWLIST,
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalStatus
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilityError,
+    KiroPhase0KASError,
+)
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -114,9 +125,13 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.profile_search import (
+    DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -132,6 +147,7 @@ logger = logging.getLogger(__name__)
 TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
+GRAPH_PROJECTION_TIMEOUT_S = 90.0
 
 
 async def flow_daemon():
@@ -204,6 +220,138 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
+    """Enforce structural caps on ``group`` (call-me-ram, PR #433 review).
+
+    ``group`` is written by the terminal's own agent via the ``update_group``
+    MCP tool with no operator review in the loop; an uncapped array lets a
+    worker grow the ``terminals.group`` TEXT column arbitrarily. Raises
+    ``ValueError`` (surfaces as 422 at every call site below) rather than
+    silently truncating — an over-cap request should fail loudly, not have
+    part of the caller's intended group silently dropped.
+    """
+    if not group:
+        return group
+    if len(group) > TERMINAL_GROUP_MAX_ELEMENTS:
+        raise ValueError(f"group has {len(group)} elements (max {TERMINAL_GROUP_MAX_ELEMENTS})")
+    for element in group:
+        if len(element) > TERMINAL_GROUP_ELEMENT_MAX_LEN:
+            raise ValueError(
+                f"group element {element!r} is {len(element)} chars "
+                f"(max {TERMINAL_GROUP_ELEMENT_MAX_LEN})"
+            )
+    return group
+
+
+def _check_metadata_size(metadata: Optional[Dict]) -> Optional[Dict]:
+    """Enforce a max-encoded-bytes cap on ``metadata`` (call-me-ram, PR #433 review).
+
+    ``metadata`` is a free-form dict the running agent writes about itself via
+    the ``update_metadata`` MCP tool; an unbounded ``Dict[str, Any]`` lets a
+    worker grow the ``terminals.metadata`` TEXT column arbitrarily, amplified
+    into every sibling's ``list_siblings`` response. Measured on the same
+    ``json.dumps`` encoding actually persisted (``WORKFLOW_MAX_SPEC_BYTES``
+    precedent), not e.g. a naive ``len(str(metadata))``.
+    """
+    if not metadata:
+        return metadata
+    encoded_len = len(json.dumps(metadata).encode("utf-8"))
+    if encoded_len > TERMINAL_METADATA_MAX_BYTES:
+        raise ValueError(
+            f"metadata is {encoded_len} bytes encoded (max {TERMINAL_METADATA_MAX_BYTES})"
+        )
+    return metadata
+
+
+class CreateSessionBody(CreateTerminalBody):
+    """Optional JSON body for POST /sessions.
+
+    Reuses the terminal-creation message payload and keeps operator-forwarded
+    environment variables in the request body, preserving the existing
+    ``{"env_vars": {...}}`` wire shape.
+
+    ``group``/``metadata`` are the #432 discovery fields (see
+    ``UpdateGroupBody``/``UpdateMetadataBody`` below for their dedicated PATCH
+    counterparts). They live here — rather than as separate top-level
+    ``Body(embed=True)`` params — so this endpoint keeps its single flat JSON
+    body wire shape (adding a second embedded body param would force FastAPI
+    to nest everything under a ``"body"`` key, breaking existing callers that
+    already POST ``{"env_vars": ..., "initial_message": ...}`` at the top
+    level, e.g. ``ops_mcp_server/server.py``'s ``_launch_session_impl``).
+    """
+
+    env_vars: Optional[Dict[str, str]] = None
+    group: Optional[List[str]] = None
+    metadata: Optional[Dict] = None
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
+
+
+def _validate_model_id(value: str) -> None:
+    """Validate a ``model`` override at the request boundary (PR #501 review).
+
+    Shared by ``RunStepRequest.model`` (field_validator below) and the
+    ``/sessions/{session_name}/terminals`` ``model`` query param, so both
+    entry points into ``terminal_service.create_terminal`` apply the same
+    rule. Raises ``ValueError``; callers translate that into the transport
+    -appropriate error (FastAPI 422 for a Pydantic field_validator, an
+    explicit 400 for the query-param call site — see that endpoint).
+
+    Raises:
+        ValueError: ``value`` exceeds MODEL_ID_MAX_LEN or contains a
+            character outside MODEL_ID_RE (whitespace, control characters,
+            and shell/quoting metacharacters are all rejected).
+    """
+    if len(value) > MODEL_ID_MAX_LEN:
+        raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
+    if not re.fullmatch(MODEL_ID_RE, value):
+        raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+class UpdateGroupBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/group`` (#432).
+
+    ``group`` is required (no default) so an omitted field is rejected with
+    422 rather than silently treated the same as an explicit ``null`` —
+    clearing the group is always an explicit choice (``null`` or ``[]``),
+    never an accident of a partial/empty body (Copilot review, PR #433).
+    """
+
+    group: Optional[List[str]]
+
+    @field_validator("group")
+    @classmethod
+    def validate_group(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _check_group_size(v)
+
+
+class UpdateMetadataBody(BaseModel):
+    """Request body for ``PATCH /terminals/{id}/metadata`` (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool.
+
+    ``metadata`` is required (no default) for the same reason as
+    ``UpdateGroupBody.group`` above: an omitted field is rejected with 422
+    instead of being indistinguishable from an explicit clearing ``null``
+    (Copilot review, PR #433).
+    """
+
+    metadata: Optional[Dict]
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
+        return _check_metadata_size(v)
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -233,12 +381,29 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
+    use_worktree: bool = Field(
+        default=False,
+        description=(
+            "Issue #100 Phase 1: provision an isolated git worktree for a freshly "
+            "created terminal instead of sharing working_directory as given. "
+            "Requires the resolved directory to be inside a git repository."
+        ),
+    )
     env_vars: Optional[Dict[str, str]] = Field(
         default=None,
         description=(
             "Workflow identity env vars injected into a freshly created terminal. "
             "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
             "values are validated but never echoed in error bodies."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit per-call model override for a freshly created terminal "
+            "(ignored when reusing a terminal), applied ahead of the agent "
+            "profile's own static model field. Lets a caller pin a specific "
+            "model for one worker without a dedicated agent profile."
         ),
     )
 
@@ -286,6 +451,20 @@ class RunStepRequest(BaseModel):
                 ) from None
         return v
 
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: Optional[str]) -> Optional[str]:
+        """See ``_validate_model_id`` -- the boundary check the model
+        override needs (PR #501 review): the value reaches a provider's
+        launch-command builder, shlex-quoted before delivery (so classic
+        word-splitting is not reachable) but a control character or newline
+        surviving quoting into the command string is still a delivery
+        hazard this codebase already guards against elsewhere."""
+        if v is None:
+            return v
+        _validate_model_id(v)
+        return v
+
     @model_validator(mode="after")
     def validate_env_var_shape(self) -> "RunStepRequest":
         """Cross-field checks (U2/C6, A3) — all surface as FastAPI-native 422s.
@@ -314,6 +493,10 @@ class RunStepRequest(BaseModel):
                 "(env injection only applies to freshly created terminals)"
             )
         return self
+
+    engine: Optional[KiroEngine] = Field(
+        default=None, description="Explicit Kiro engine for this child step"
+    )
 
 
 class RunStepResponse(BaseModel):
@@ -415,6 +598,83 @@ class InstallAgentProfileRequest(BaseModel):
     env_vars: Optional[Dict[str, str]] = None
 
 
+# Scaffold templates are identified as ``category/name`` (e.g.
+# ``aws/stepfunction``). Constraining that identifier with an allowlist pattern
+# at the API boundary rejects traversal attempts before they reach the scaffold
+# service — which independently re-checks containment via ``_check_containment``.
+# Allowlist rather than denylist is deliberate: a denylist of dot sequences is
+# always incomplete.
+TEMPLATE_NAME_PATTERN = r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$"
+
+
+class TemplateConfigRequest(BaseModel):
+    """Request body for the non-mutating template validate and preview routes."""
+
+    template: str = Field(
+        pattern=TEMPLATE_NAME_PATTERN,
+        max_length=128,
+        description="Template identifier in 'category/name' form, e.g. 'aws/stepfunction'",
+    )
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Flat config values matching the template's JSON-Schema",
+    )
+
+
+class TemplateSummary(BaseModel):
+    """Public template metadata. Excludes the internal filesystem path."""
+
+    name: str
+    description: str
+
+
+class ValidateTemplateConfigResponse(BaseModel):
+    """Outcome of validating a config against a template's JSON-Schema."""
+
+    valid: bool
+    errors: List[str] = Field(default_factory=list)
+
+
+class PreviewTemplateResponse(BaseModel):
+    """A rendered profile. Returned to the caller and never written to disk."""
+
+    template: str
+    content: str
+
+
+class ProfileValidationRequest(BaseModel):
+    """Request body for the non-mutating profile validate route."""
+
+    content: str = Field(
+        max_length=262_144,
+        description="Full profile markdown, including YAML frontmatter",
+    )
+
+
+class ProfileValidationMessage(BaseModel):
+    """One validation finding.
+
+    ``path`` is the dotted frontmatter location for JSON-Schema errors and is
+    absent for convention checks that are not tied to a single key.
+    """
+
+    severity: Literal["error", "warning"]
+    message: str
+    path: Optional[str] = None
+
+
+class ProfileValidationResponse(BaseModel):
+    """Outcome of validating a profile's frontmatter.
+
+    ``valid`` is False only when at least one error-severity finding is
+    present. Warnings are advisory and do not invalidate a profile, so a
+    client should block a save on errors alone.
+    """
+
+    valid: bool
+    messages: List[ProfileValidationMessage] = Field(default_factory=list)
+
+
 class MemorySummary(BaseModel):
     """Memory list entry. Excludes file_path (absolute server filesystem path)."""
 
@@ -491,6 +751,11 @@ def _reconcile_terminals_at_startup() -> None:
     Best-effort: failures are logged and skipped, never blocking startup.
     """
     try:
+        from cli_agent_orchestrator.clients.database import (
+            list_all_terminals,
+            list_pending_receiver_ids_older_than,
+        )
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.providers.manager import provider_manager
 
         pending_ids = list_pending_receiver_ids_older_than(0)
@@ -571,6 +836,19 @@ def _reconcile_terminals_at_startup() -> None:
         logger.warning("Inbox recovery at startup failed: %s", exc)
 
 
+def _seed_default_skills_at_startup() -> None:
+    """Seed newly packaged skills without overwriting an existing installation."""
+    try:
+        seeded_count = seed_default_skills()
+        if seeded_count:
+            logger.info("Seeded %d new builtin skill(s).", seeded_count)
+    except Exception as exc:
+        logger.warning(
+            "automatic builtin skill seeding failed (%s); run `cao init` to retry",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -588,6 +866,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     _reconcile_terminals_at_startup()
     registry = PluginRegistry()
@@ -610,6 +889,31 @@ async def lifespan(app: FastAPI):
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
+    # Start ApprovalBridge when AG-UI surface is enabled
+    approval_bridge_task: Optional[asyncio.Task] = None
+    from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
+
+    if agui_surface_enabled():
+        from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
+        from cli_agent_orchestrator.services.agui.base import InProcessUiEmitter
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            AgentHandoffWithApproval,
+            TerminalServiceAnswerDelivery,
+        )
+
+        approval_emitter = InProcessUiEmitter()
+        approval_construct = AgentHandoffWithApproval(
+            emitter=approval_emitter,
+            # Deliver resolved decisions to the waiting CLI via the tmux input
+            # path so approve/deny/edit actually reach the terminal (not just
+            # mark the interrupt resolved).
+            answer_delivery=TerminalServiceAnswerDelivery(),
+        )
+        approval_bridge = ApprovalBridge(construct=approval_construct)
+        app.state.approval_bridge = approval_bridge
+        approval_bridge_task = asyncio.create_task(approval_bridge.run())
+        logger.info("ApprovalBridge started")
 
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
@@ -654,6 +958,13 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    # Cancel approval bridge on shutdown
+    if approval_bridge_task is not None:
+        approval_bridge_task.cancel()
+        try:
+            await approval_bridge_task
+        except asyncio.CancelledError:
+            pass
     # Cancel daemon on shutdown
     daemon_task.cancel()
 
@@ -1033,10 +1344,26 @@ async def agui_stream(
     else:
         scopes = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
 
+    # Validate ?since= as ISO-8601 before streaming starts (L1 Cleanup B).
+    # A malformed value must produce HTTP 400 immediately rather than being
+    # swallowed inside the failure-isolated replay block.
+    if since:
+        try:
+            # Python 3.10 fromisoformat() does not handle trailing 'Z';
+            # normalize it to '+00:00' for cross-version compatibility.
+            _since_normalized = since.replace("Z", "+00:00") if since.endswith("Z") else since
+            datetime.fromisoformat(_since_normalized)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ISO-8601 timestamp for 'since': {since!r}",
+            )
+
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.clients.database import list_terminals_by_session
     from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
         state_delta_frame,
         state_snapshot_frame,
@@ -1068,6 +1395,37 @@ async def agui_stream(
         prefix = f"id: {event_id}\n" if event_id is not None else ""
         return f"{prefix}event: {agui_type}\ndata: {json.dumps(data)}\n\n"
 
+    def _sse_frames(event_id: Optional[str], frames: List[Tuple[str, Dict]]) -> List[str]:
+        """Format the (possibly multiple) SSE frames produced by one record.
+
+        A single event-log record can expand into more than one AG-UI frame
+        (e.g. a primary frame plus a synthesized ``TOOL_CALL_END``/``RESULT``).
+        Emitting them all under the same SSE ``id:`` (the record id) makes it
+        impossible for clients to dedupe/process the later frames and breaks
+        reconnects: a client that dropped mid-record and reconnects with
+        ``Last-Event-ID=<rid>`` would never receive the frames that shared it.
+
+        So we give the intermediate frames unique derived ids (``<rid>.<i>``)
+        and keep the canonical record id on the *last* frame. A normal
+        end-of-record reconnect therefore still sends a real event-log id and
+        resumes precisely via ``after_id``; a mid-record drop reconnects with a
+        derived id that ``after_id`` won't find, which safely replays every
+        fresh record (the client dedupes) rather than silently skipping frames.
+        Single-frame records are unchanged -- they keep the bare record id.
+        """
+
+        last = len(frames) - 1
+        out: List[str] = []
+        for i, (ftype, fdata) in enumerate(frames):
+            if event_id is None:
+                frame_id: Optional[str] = None
+            elif i == last:
+                frame_id = event_id
+            else:
+                frame_id = f"{event_id}.{i}"
+            out.append(_sse(frame_id, ftype, fdata))
+        return out
+
     async def event_generator():
         # Register the live subscription BEFORE replaying history / taking the
         # snapshot, so an event published during the replay->live handoff is
@@ -1081,6 +1439,7 @@ async def agui_stream(
         # events on an open connection) so the client reconnects with
         # Last-Event-ID and replays the dropped records exactly once (F2).
         sub = bus.register(overflow_close=True)
+        tracker = ToolCallLifecycleTracker()
         try:
             replayed_ids: set = set()
 
@@ -1102,7 +1461,8 @@ async def agui_stream(
                         if rid is not None:
                             replayed_ids.add(rid)
                         rtype, rdata = to_agui_event(record)
-                        yield _sse(rid, rtype, rdata)
+                        for frame in _sse_frames(rid, list(tracker.feed(record, (rtype, rdata)))):
+                            yield frame
             except Exception:
                 logger.warning("agui_stream: history replay failed", exc_info=True)
 
@@ -1130,7 +1490,8 @@ async def agui_stream(
                     replayed_ids.discard(rid)
                     continue
                 agui_type, data = to_agui_event(event)
-                yield _sse(rid, agui_type, data)
+                for frame in _sse_frames(rid, list(tracker.feed(event, (agui_type, data)))):
+                    yield frame
 
                 # Recompute the fleet snapshot and emit a STATE_DELTA when it
                 # moved. NB: recomputes on every event; a debounce/cache is a
@@ -1146,6 +1507,10 @@ async def agui_stream(
                     prev_snapshot = curr
                 except Exception:
                     logger.warning("agui_stream: STATE_DELTA computation failed", exc_info=True)
+
+            # Session end: synthesize closers for any remaining open tool calls.
+            for ftype, fdata in tracker.close_all():
+                yield _sse(None, ftype, fdata)
         finally:
             bus.unregister(sub)
 
@@ -1210,6 +1575,204 @@ async def agui_emit_ui(
     return {"ok": True, "event_id": event.get("id"), "component": body.component}
 
 
+# ---------------------------------------------------------------------------
+# Interrupt resume endpoint (human-in-the-loop approval)
+# ---------------------------------------------------------------------------
+
+
+class ResumeInterruptRequest(BaseModel):
+    decision: str = Field(..., description="One of: approve, deny, edit")
+    edited_text: Optional[str] = Field(None, description="Required when decision is 'edit'")
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, v: str) -> str:
+        allowed = {"approve", "deny", "edit"}
+        if v not in allowed:
+            raise ValueError(f"decision must be one of {sorted(allowed)}")
+        return v
+
+
+@app.post("/agui/v1/interrupts/{interrupt_id}/resume")
+async def agui_resume_interrupt(
+    interrupt_id: str,
+    body: ResumeInterruptRequest,
+    _enabled: None = Depends(_require_agui_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resume a pending approval interrupt with the user's decision.
+
+    Idempotent: re-resuming an already-resolved interrupt returns the recorded
+    outcome with no side effects (no keystrokes re-sent).
+
+    Guards:
+    - 404 when AG-UI surface disabled
+    - 404 for unknown interrupt_id
+    - 422 for invalid decision or edit validation failure
+    - Requires cao:write or cao:admin when auth is enabled
+    """
+    from cli_agent_orchestrator.services.agui.handoff_approval import (
+        ApprovalDecision,
+        DeliveryError,
+    )
+
+    bridge = getattr(app.state, "approval_bridge", None)
+    if bridge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval bridge not initialized",
+        )
+
+    construct = bridge.construct
+    interrupt = construct.get_interrupt(interrupt_id)
+    if interrupt is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown interrupt: {interrupt_id}",
+        )
+
+    try:
+        decision_enum = ApprovalDecision(body.decision)
+    except ValueError:  # pragma: no cover - validate_decision 422s bad values first
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid decision: {body.decision}",
+        )
+
+    try:
+        result = await construct.resume(
+            interrupt_id=interrupt_id,
+            decision=decision_enum,
+            edited_text=body.edited_text,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e),
+        )
+    except DeliveryError as e:
+        # Delivery to the terminal failed; the interrupt is left unresolved and
+        # retryable. Surface a non-success status with a machine-readable
+        # retryable flag rather than reporting the resolution as successful (P1).
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": f"Failed to deliver decision to terminal: {e}",
+                "retryable": True,
+            },
+        )
+
+    return {
+        "ok": True,
+        "interrupt_id": result.id,
+        "resolved": result.resolved,
+        "outcome": result.outcome,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run plane endpoint (AG-UI stock wire dialect)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/agui/v1/run")
+async def agui_run(
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream AG-UI stock events for a run (POST /agui/v1/run).
+
+    Accepts a RunAgentInput body (camelCase) and streams lifecycle-legal SSE
+    frames using the official ag-ui-protocol EventEncoder. Each frame is a
+    ``data:`` line containing camelCase JSON with a ``type`` field.
+
+    When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
+    mutating interrupt state). Otherwise ``cao:read`` is the floor.
+
+    Returns 501 when the ``ag-ui-protocol`` package is not installed (the
+    [agui] optional extra was not included at install time).
+    Returns 404 when the AG-UI surface is disabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.run_plane import AG_UI_AVAILABLE
+
+    if not AG_UI_AVAILABLE:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": (
+                    "ag-ui-protocol is not installed. "
+                    "Install with: pip install cli-agent-orchestrator[agui]"
+                )
+            },
+        )
+
+    # Parse the body
+    body = await request.json()
+
+    # Scope escalation: if resume[] is non-empty, require cao:write
+    resume_entries = body.get("resume") or []
+    if resume_entries:
+        if not any(s in _scopes for s in (SCOPE_WRITE, SCOPE_ADMIN)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="cao:write required when resume[] is non-empty",
+            )
+
+    # Get approval construct from app state
+    bridge = getattr(app.state, "approval_bridge", None)
+    approval_construct = bridge.construct if bridge is not None else None
+
+    # Build the snapshot function
+    def _fleet_snapshot() -> Dict:
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import session_service
+        from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(list_terminals_by_session(sess["id"]))
+            except Exception:
+                pass
+        return build_dashboard_snapshot(sessions, terminals, list(_scopes))
+
+    # Build the bus subscription function
+    async def _bus_events():
+        from cli_agent_orchestrator.services.sse_bus import get_bus
+
+        sse_bus = get_bus()
+        sub = sse_bus.register(overflow_close=True)
+        try:
+            async for event in sse_bus.drain(sub):
+                yield event
+        finally:
+            sse_bus.unregister(sub)
+
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.services.agui.run_plane import (
+        get_run_plane_content_type,
+        run_plane_stream,
+    )
+
+    accept_header = request.headers.get("accept")
+    content_type = get_run_plane_content_type(accept_header)
+
+    return StreamingResponse(
+        run_plane_stream(
+            input_data=body,
+            approval_construct=approval_construct,
+            snapshot_fn=_fleet_snapshot,
+            bus_subscribe_fn=_bus_events,
+            accept=accept_header,
+        ),
+        media_type=content_type,
+    )
+
+
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
 # view consumed alongside the /events stream above. The mount is default-off
 # (no-op unless CAO_MCP_APPS_ENABLED is set) and idempotent, so re-importing this
@@ -1229,6 +1792,198 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list agent profiles: {str(e)}",
         )
+
+
+def _resolve_template_name(template: str) -> str:
+    """Map a caller-supplied template id onto an enumerated template name.
+
+    Returns the matching value from ``list_templates()`` (built from filesystem
+    enumeration), never the caller's own string, so the identifier handed to the
+    scaffold service — and thence to ``Path`` — is not derived from request
+    data. This is the sanitizer that removes the taint CodeQL flags on the
+    scaffold path expressions; the allowlist regex and ``_check_containment``
+    remain as additional layers. Raises 404 for an unknown template.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    for known in list_templates():
+        if known["name"] == template:
+            return str(known["name"])
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Template not found: {template}",
+    )
+
+
+# The static sub-paths below (`/search`, `/templates`, and the template schema
+# route) MUST stay declared ABOVE `/agents/profiles/{name}`. FastAPI resolves in
+# declaration order, so moving them below would let the `{name}` route capture
+# "search" and "templates" as profile names. test_api_profile_surface.py pins
+# this ordering.
+@app.get("/agents/profiles/search")
+async def search_agent_profiles_endpoint(
+    q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
+    limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+) -> List[Dict]:
+    """Rank installed agent profiles against ``q``.
+
+    Delegates to ``services.profile_search.search_profiles`` so HTTP, the CLI
+    (``cao profile find``) and the ``find_profiles`` MCP tool return identical
+    ordering and scores — no ranking logic lives here. The service excludes
+    profiles that ``load_agent_profile()`` would reject, and results are
+    metadata-only: the profile prompt body is never returned.
+    """
+    from cli_agent_orchestrator.services.profile_search import search_profiles
+
+    try:
+        return search_profiles(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates")
+async def list_profile_templates_endpoint() -> List[TemplateSummary]:
+    """List public scaffold-template metadata for profile creation."""
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    try:
+        return [
+            TemplateSummary(
+                name=template["name"],
+                description=template.get("description", ""),
+            )
+            for template in list_templates()
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list profile templates: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates/{category}/{name}/schema")
+async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict:
+    """Return the JSON-Schema for one scaffold template.
+
+    ``category`` and ``name`` are two path segments rather than one so the
+    ``category/name`` template identifier survives routing without a
+    percent-encoded slash. The pair is allowlist-validated here and the scaffold
+    service re-checks containment independently.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import get_template_schema
+
+    template = f"{category}/{name}"
+    if not re.fullmatch(TEMPLATE_NAME_PATTERN, template):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid template name: {template}",
+        )
+
+    resolved = _resolve_template_name(template)
+    try:
+        schema = get_template_schema(resolved)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if schema is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No schema found for template '{template}'",
+        )
+    return schema
+
+
+@app.post("/agents/profiles/templates/validate")
+async def validate_profile_template_config_endpoint(
+    request: TemplateConfigRequest,
+) -> ValidateTemplateConfigResponse:
+    """Validate a config against a template's JSON-Schema. Writes nothing.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``. This is a POST only because the
+    config travels in a JSON body rather than a query string; it mutates no
+    state. The write-scope guard belongs on the create/edit routes that persist
+    a profile, not on validation.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        errors = validate_config(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ValidateTemplateConfigResponse(valid=not errors, errors=errors)
+
+
+@app.post("/agents/profiles/templates/preview")
+async def preview_profile_template_endpoint(
+    request: TemplateConfigRequest,
+) -> PreviewTemplateResponse:
+    """Render a template to markdown and return it. Writes nothing.
+
+    Same non-mutating rationale as template validation: rendering is a pure function of
+    the template and the supplied config. ``render_template`` validates the
+    config first, so an invalid config returns 400 rather than partial output.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        content = render_template(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return PreviewTemplateResponse(template=request.template, content=content)
+
+
+@app.post("/agents/profiles/validate")
+async def validate_agent_profile_endpoint(
+    request: ProfileValidationRequest,
+) -> ProfileValidationResponse:
+    """Validate a profile's frontmatter against the profile schema. Writes nothing.
+
+    Distinct from ``/agents/profiles/templates/validate``, which checks a
+    *template config* against that template's own schema. This checks a
+    *finished profile* against ``agent_profile.schema.json`` plus CAO
+    conventions, and is the HTTP equivalent of ``cao profile validate``.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``, for the same reason as the
+    template validate route: this is a POST only because the profile content
+    travels in a JSON body rather than a query string, and it mutates no state.
+    """
+    from cli_agent_orchestrator.services.profile_validator import validate_profile_text
+
+    try:
+        findings = validate_profile_text(request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileValidationResponse(
+        valid=not any(f.severity == "error" for f in findings),
+        messages=[
+            ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
+            for f in findings
+        ],
+    )
+
+
+@app.get("/agents/profiles/schema")
+async def get_agent_profile_schema_endpoint() -> Dict:
+    """Return the agent profile JSON-Schema.
+
+    Lets a client render create and edit forms from the server's own schema
+    definition instead of duplicating the field list. Declared above
+    ``GET /agents/profiles/{name}`` because FastAPI matches in declaration
+    order, and the path parameter would otherwise capture "schema" as a name.
+    """
+    from cli_agent_orchestrator.services.profile_validator import load_profile_schema
+
+    return load_profile_schema()
 
 
 @app.get("/agents/profiles/{name}")
@@ -1323,9 +2078,12 @@ class AgentDirsUpdate(BaseModel):
 @app.get("/settings/memory")
 async def get_memory_settings_endpoint() -> Dict:
     """Return whether the memory subsystem is enabled (for UI feature discovery)."""
-    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        is_memory_enabled,
+    )
 
-    return {"enabled": is_memory_enabled()}
+    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
 
 
 @app.post("/settings/agent-dirs")
@@ -1431,7 +2189,9 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
-    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    engine: Optional[KiroEngine] = None,
+    model: Optional[str] = None,
+    body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
@@ -1443,11 +2203,33 @@ async def create_session(
     the curator reaches IDLE; ``get_curated_memory_context`` falls back to
     Phase 1 in that window.
 
-    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    ``body.env_vars`` is the optional operator-forwarded env map
     from ``cao launch --env``. It travels in the JSON body — not the query
     string — so values potentially containing secrets do not land in
     cao-server's HTTP access log. See issue #248.
+
+    When ``body.initial_message`` is present, session creation reuses the
+    existing deferred terminal-initialization path: the response is returned
+    after the session and terminal record are created, then provider
+    initialization and message delivery continue in the background. This
+    narrows the create-then-send window but is not a transactional operation;
+    deferred failures follow terminal_service's existing logging and best-
+    effort cleanup behavior.
+
+    ``model`` is an optional per-launch override. It uses the same validation
+    and provider handoff as the existing terminal-creation endpoint.
+
+    ``body.group``/``body.metadata`` are the #432 discovery fields, set on
+    the initial terminal at creation time (``group`` is also updatable later
+    via ``PATCH /terminals/{id}/group``, ``metadata`` via the
+    ``update_metadata`` MCP tool).
     """
+    initial_message = body.initial_message if body else None
+    initial_message_orchestration_type = None
+    # Structural caps on group/metadata (call-me-ram, PR #433 review) are
+    # enforced by CreateSessionBody's own field_validators above — invalid
+    # values fail Pydantic body parsing and FastAPI returns 422 automatically,
+    # before this function body ever runs.
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -1463,6 +2245,22 @@ async def create_session(
                 else f"{SESSION_PREFIX}{session_name}"
             )
             validate_tmux_name(effective, "session_name")
+        if model is not None:
+            _validate_model_id(model)
+        if initial_message == "":
+            raise ValueError("initial_message must not be empty")
+        if body and body.initial_message_orchestration_type:
+            if initial_message is None:
+                raise ValueError("initial_message_orchestration_type requires initial_message")
+            try:
+                initial_message_orchestration_type = OrchestrationType(
+                    body.initial_message_orchestration_type
+                )
+            except ValueError:
+                raise ValueError(
+                    "invalid initial_message_orchestration_type: "
+                    f"{body.initial_message_orchestration_type!r}"
+                )
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -1473,7 +2271,13 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
-            env_vars=env_vars,
+            env_vars=body.env_vars if body else None,
+            engine=engine,
+            initial_message=initial_message,
+            initial_message_orchestration_type=initial_message_orchestration_type,
+            model=model,
+            group=body.group if body else None,
+            metadata=body.metadata if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -1579,8 +2383,11 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1599,9 +2406,24 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``model``: optional explicit override, applied ahead of the agent
+    profile's own static ``model`` field (where the resolved provider
+    supports it -- see ``terminal_service.create_terminal``'s own docstring).
+    Lets a caller pin a specific model for one worker without needing a
+    dedicated agent profile.
+
+    ``use_worktree`` (issue #100 Phase 1): provision an isolated git worktree
+    for this terminal instead of sharing ``working_directory`` as given. A
+    plain boolean routing flag, so it stays a query param alongside
+    ``defer_init`` rather than moving into the JSON body. Runs synchronously
+    before the deferred-init background task (if any) is scheduled, so it
+    applies the same way regardless of ``defer_init``.
     """
     try:
         validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -1662,14 +2484,27 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except (KiroPhase0KASError, KiroCapabilityError) as e:
+        # Both subclass ValueError, so they must precede the generic arm below —
+        # a rejected engine is a bad request, not a missing resource. Matches
+        # POST /sessions, which already returns 400 for the identical failure.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem,
+        # not a server crash.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1713,6 +2548,140 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/group", response_model=Terminal)
+async def update_terminal_group_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateGroupBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's group array (#432).
+
+    Lets a consumer whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment,
+    harness-control#92) keep ``group`` from going stale. ``group`` is
+    required in the request body: an explicit ``null`` or ``[]`` clears it
+    (opting the terminal back out of discovery), while omitting the field
+    entirely is rejected with 422 rather than silently clearing it.
+    """
+    try:
+        updated = await asyncio.to_thread(terminal_service.update_group, terminal_id, body.group)
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal group: {str(e)}",
+        )
+
+
+@app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
+async def update_terminal_metadata_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateMetadataBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Replace a terminal's free-form metadata dict (#432).
+
+    Called by the running agent itself via the ``update_metadata`` MCP tool
+    (as well as by any other authorized API caller). Whole-dict replace, not
+    a merge -- concurrent calls are last-write-wins (tedswinyar, PR #433
+    review); an acceptable design for this field, but callers should re-send
+    the full intended dict rather than assuming a partial update accumulates.
+    """
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_metadata, terminal_id, body.metadata
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
+            )
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        return Terminal(**terminal)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal metadata: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/siblings")
+async def list_terminal_siblings(
+    terminal_id: TerminalId,
+    depth: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "How many leading elements of this terminal's own group to match "
+            "against. Omit for the widest scope this terminal is allowed to "
+            "see (its full own group). Server clamps to at most len(own "
+            "group) — can never exceed it. depth=0 is rejected (422) rather "
+            "than silently reinterpreted as an unscoped, all-terminals query."
+        ),
+    ),
+    cross_session: bool = Query(
+        default=False,
+        description=(
+            "Sibling discovery is session-scoped by default (issue #432 "
+            "design discussion, 2026-07-17/18): results are additionally "
+            "filtered to this terminal's own tmux session unless this is "
+            "explicitly set to true. Prevents two unrelated CAO sessions "
+            "that happen to reuse the same group prefix from silently "
+            "discovering each other."
+        ),
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
+
+    ``terminal_id`` in the URL IS the caller's resolved identity — the MCP
+    ``list_siblings`` tool passes its own ``CAO_TERMINAL_ID`` here, never a
+    client-supplied "who am I" claim (same mechanism ``send_message``/
+    ``handoff`` already use). This endpoint only ever compares against THAT
+    terminal's own persisted ``group``, so a caller can never request a scope
+    wider than its own group no matter what ``depth`` is passed. A terminal
+    with no ``group`` set finds no siblings — it participates in no
+    discovery — rather than erroring or matching everything.
+
+    Session-scoped by default: results are also filtered to this terminal's
+    own ``tmux_session`` unless ``cross_session=true`` is explicitly passed
+    (issue #432 design discussion). ``group`` is an organizational label,
+    not a security boundary — on a default install with auth disabled, a
+    worker already has local shell access, so nothing here provides tenant
+    isolation even with session scoping applied; see docs/api.md.
+
+    Each result includes a ``status`` (tedswinyar, PR #433 review): a live,
+    point-in-time snapshot, not a guarantee. A handoff terminal can still
+    complete and delete itself between this call returning and a caller's
+    follow-up message to it, so callers should still expect sends to an
+    apparently-live sibling to occasionally fail.
+    """
+    try:
+        # 404 if the terminal itself doesn't exist, distinct from "exists but
+        # has no group" (empty list result, not an error — #432).
+        await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    try:
+        return await asyncio.to_thread(
+            terminal_service.list_siblings, terminal_id, depth=depth, cross_session=cross_session
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list siblings: {str(e)}",
         )
 
 
@@ -1968,9 +2937,12 @@ async def run_step(
             working_directory=body.working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
+            engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            model=body.model,
+            use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -2001,9 +2973,20 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
+    except (KiroPhase0KASError, KiroCapabilityError) as e:
+        # Ordered before the ValueError arm they subclass: an engine rejection is
+        # a bad request, not an unknown terminal.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem
+        # (bad/missing repo), not a server crash.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         _settle_step(None, str(e))
         raise HTTPException(
@@ -2087,6 +3070,66 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return [row.model_dump() for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# ROUTE-ORDERING HAZARD (U4, issue #505, RO-1/RO-2). ``GET /workflows/runs`` MUST
+# be declared IMMEDIATELY BEFORE the ``GET /workflows/{name}`` catch-all below.
+# FastAPI matches routes in declaration order, and ``{name}`` is a SINGLE path
+# segment, so if the catch-all were declared first it would capture the literal
+# segment ``runs`` as ``name="runs"`` and this list route would be dead. Do NOT
+# "tidy" this route back below the catch-all. Only this bare single-segment
+# collection route collides; the deeper two-segment run routes
+# (``/workflows/runs/{run_id}`` and ``/workflows/runs/{run_id}/result``) can never
+# be shadowed by a single-segment ``{name}`` and are safe at any position. The
+# NFR-2a regression test (mirroring the #510 ``/agents/profiles/search`` precedent)
+# is the load-bearing guard against a future reorder.
+# --------------------------------------------------------------------------- #
+@app.get("/workflows/runs")
+async def list_workflow_runs_endpoint(
+    state: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List journaled workflow runs newest-first as narrow summaries (U4, FR-3.3).
+
+    Journal-authoritative read: a thin mapper over U1's
+    ``workflow_journal.list_runs`` (RunSummaryRow projection, ORDER BY
+    ``started_at DESC, run_id DESC``). The state-legality check that the DAL
+    deliberately omits lives at this REST boundary (LR-1): an illegal ``state``
+    filter is a 400; a legal-but-unmatched value simply yields ``[]``. ``limit`` is
+    clamped to ``[1, 500]`` by FastAPI at the boundary (LR-2). An empty result is a
+    200 with ``[]`` (LR-3), never a 404. A ``sqlite3.Error`` from the DAL maps to
+    500 (LR-4) — a silently empty list would hide a broken database from a human
+    who explicitly asked to list runs.
+
+    No-id ``status`` floor (SR-1, FR-4.8): ``?limit=1`` returns the
+    most-recently-started run (any state), which U5/U6 consume to resolve
+    ``status`` with no explicit run id.
+    """
+    import sqlite3
+    from dataclasses import asdict
+
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import workflow_journal
+
+    if state is not None:
+        try:
+            RunState(state)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"illegal run state filter '{state}'",
+            )
+
+    try:
+        rows = workflow_journal.list_runs(state=state, limit=limit)
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to list runs: {e}",
+        )
+    return [asdict(row) for row in rows]
 
 
 @app.get("/workflows/{name}")
@@ -2176,6 +3219,185 @@ async def record_step_output_endpoint(
 # tool. Error mapping (C5 / B3-BR-14): unknown run/spec -> 404, invalid spec/inputs
 # -> 400, cancel-of-finished -> 409, NotBuiltYetError (reserved seam) -> 501,
 # WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
+
+
+_EVENTS_ROUTE_PATH = "/workflows/runs/{run_id}/events"
+
+
+def _events_route_registered() -> bool:
+    """Whether THIS build actually serves the events route (CD-1).
+
+    The events route is owned by issue #504 and is absent from this branch, so
+    advertising it unconditionally put a link that 404s into EVERY accepted-run
+    response. Rather than hard-code either answer — which would need a follow-up
+    edit the moment the merge order changed — ask the running app what it serves.
+    The check is over the app's own route table (no I/O, no network) and it
+    self-heals: the link appears automatically once #504's route is registered,
+    with no code change at the rebase.
+    """
+    return any(getattr(r, "path", None) == _EVENTS_ROUTE_PATH for r in app.routes)
+
+
+def _run_links(run_id: str) -> Dict[str, str]:
+    """Build the 202 body's ``links`` map for a submitted run (U2, ADR-1, RR-2).
+
+    Each value is a **relative** URL (host/port/scheme-agnostic so they work behind
+    a proxy and in the test client, which joins them onto its own base URL).
+    ``cancel`` resolves to the existing cancel route; ``self``/``status`` both point
+    at the snapshot route.
+
+    ``events`` is CONDITIONAL (CD-1): it is present only when this build actually
+    serves the route (#504). A ``links`` map is a capability advertisement, and a
+    role that 404s is worse than an absent one — a client that feature-detects by
+    key presence does the right thing either way, whereas one that trusts an
+    advertised role gets a 404 on its first call. Clients must therefore treat
+    ``events`` as optional; the four unconditional roles are always present.
+    """
+    links = {
+        "self": f"/workflows/runs/{run_id}",
+        "status": f"/workflows/runs/{run_id}",
+        "result": f"/workflows/runs/{run_id}/result",
+        "cancel": f"/workflows/runs/{run_id}/cancel",
+    }
+    if _events_route_registered():
+        links["events"] = f"/workflows/runs/{run_id}/events"
+    return links
+
+
+# --- Background-drive task registry + admission bound (issue #505 review) ---
+#
+# STRONG REFERENCES (BG-1). ``asyncio`` keeps only a WEAK reference to a task, so a
+# bare ``asyncio.create_task(...)`` whose Task object is discarded can be garbage
+# collected while it is suspended on a future it alone roots — the drive simply
+# stops, and the journal row it was going to settle stays RUNNING forever. Those
+# rows are the durable record this feature exists to provide, so every drive task
+# is held in this module-level set until it completes and discards itself via a
+# done-callback.
+_background_drives: "set[asyncio.Task]" = set()
+
+# ADMISSION BOUND (AB-1). See WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES: the async
+# route has none of the blocking route's natural back-pressure, so the semaphore is
+# the only thing standing between N submits and N concurrent drives. Created lazily
+# because a module-level asyncio primitive binds to whatever loop is current at
+# import time, which is not necessarily the loop the app runs on (notably under
+# TestClient, which creates a fresh loop per client).
+_drive_semaphore: "Optional[asyncio.Semaphore]" = None
+
+
+def _get_drive_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide background-drive admission semaphore (AB-1, lazy)."""
+    from cli_agent_orchestrator.constants import WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES
+
+    global _drive_semaphore
+    if _drive_semaphore is None:
+        _drive_semaphore = asyncio.Semaphore(WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES)
+    return _drive_semaphore
+
+
+def _schedule_background_drive(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> "asyncio.Task":
+    """Schedule a background drive, holding a STRONG reference to its Task (BG-1).
+
+    The done-callback discards the reference on EVERY completion path (normal,
+    exception, cancellation), so the set cannot grow without bound. Returns the
+    Task so a caller/test can await or cancel it.
+    """
+    task = asyncio.create_task(
+        _run_in_background(record, spec, run_id, tier, inputs),
+        name=f"workflow-drive-{run_id}",
+    )
+    _background_drives.add(task)
+    task.add_done_callback(_background_drives.discard)
+    return task
+
+
+async def _run_in_background(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> None:
+    """The fire-and-forget background drive for an async-submitted run (U2, C2).
+
+    Scheduled with ``asyncio.create_task`` AFTER the durable insert committed and
+    the 202 was returned — it holds no client socket. It invokes ONLY the dedicated
+    **prepared** engine entries (``start_run_prepared`` /
+    ``run_script_workflow_prepared``), never the blocking ``start_run`` /
+    ``run_script_workflow`` (which would re-admit and re-insert — the double-insert
+    / double-admission hazard, ADR-3 / DR-1). The prepared entries' own
+    write-through settles the terminal state.
+
+    BR-1: it NEVER re-raises into the event loop — every exception is terminal for
+    the task. BR-2: if an exception escaped BEFORE the engine settled the row, it
+    best-effort marks the run FAILED (its own ``try``/``except``) so a scheduling
+    bug can never orphan a run stuck in RUNNING. The ``ScriptRunRecord`` carries no
+    ``inputs`` field, so the resolved inputs are threaded in explicitly to build the
+    script spawn env via the single-homed public ``build_env`` seam.
+
+    BR-2a (issue #505 review): the backstop covers CANCELLATION too. ``CancelledError``
+    derives from ``BaseException``, NOT ``Exception``, so an ``except Exception``
+    backstop does not see it — on interpreter shutdown (or any task cancel) the
+    exception would propagate straight out and leave the journal row stuck in
+    RUNNING forever, exactly the outcome BR-2 exists to prevent. It is handled in its
+    OWN arm that writes the same FAILED backstop and then RE-RAISES, because
+    swallowing a cancellation would break cooperative-cancellation semantics for the
+    caller. The semaphore (AB-1) is acquired here rather than in the handler so a
+    queued run still holds its durable row and its already-returned 202.
+
+    BR-2b (PR #525 review): the backstop is STATE-GUARDED. Written unconditionally it
+    fired on any exception, including one raised AFTER the engine had already settled
+    the row — turning a true COMPLETED/CANCELLED into a false FAILED. The journal row
+    is the durable record of what actually happened, so a wrong terminal state is
+    worse than the orphaned-RUNNING hole BR-2 closes: an orphan is visibly stuck,
+    whereas a wrong terminal state is indistinguishable from a real one. The guard is
+    a conditional UPDATE in the DAL (``settle_run_state_if_running``), atomic rather
+    than a read-then-write here, so no concurrent settle can land between the check
+    and the write. The never-settled case still lands FAILED — BR-2's guarantee is
+    narrowed, not removed.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    def _failed_backstop(why: str) -> None:
+        """Mark the run FAILED **only if still RUNNING**; itself guarded so it can never re-raise."""
+        try:
+            settled = workflow_journal.settle_run_state_if_running(
+                run_id, RunState.FAILED.value, workflow_service._now()
+            )
+            if not settled:
+                # BR-2b: the engine already settled this row. Logged explicitly —
+                # an unobservable no-op is indistinguishable from a broken guard
+                # when this is read back after an incident.
+                logger.info(
+                    "background workflow run '%s' already settled; FAILED backstop "
+                    "not written (%s)",
+                    run_id,
+                    why,
+                )
+        except Exception:  # noqa: BLE001 — the backstop is itself best-effort
+            logger.error(
+                "background workflow run '%s' FAILED-backstop journal write failed (%s)",
+                run_id,
+                why,
+                exc_info=True,
+            )
+
+    try:
+        async with _get_drive_semaphore():
+            if tier == "yaml":
+                await workflow_service.start_run_prepared(record)
+            else:
+                env = script_runner.build_env(run_id, "1", inputs)
+                await script_runner.run_script_workflow_prepared(record, spec.path, env)
+    except asyncio.CancelledError:
+        # BR-2a: cancellation is NOT an Exception subclass — settle the durable row
+        # before letting the cancellation continue to propagate.
+        logger.warning("background workflow run '%s' drive cancelled; marking FAILED", run_id)
+        _failed_backstop("cancelled")
+        raise
+    except Exception:  # noqa: BLE001 — BR-1: the task must never re-raise into the loop
+        logger.error("background workflow run '%s' drive failed", run_id, exc_info=True)
+        # BR-2: the engine's own write-through normally settles the terminal state;
+        # this only fires if the exception escaped before the engine settled the row.
+        _failed_backstop("drive raised")
 
 
 @app.post("/workflows/runs")
@@ -2268,6 +3490,253 @@ async def start_workflow_run_endpoint(
     return result.model_dump()
 
 
+@app.post("/workflows/runs:submit", status_code=status.HTTP_202_ACCEPTED)
+async def submit_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Submit a workflow run asynchronously: durably record it, ack 202, drive in background.
+
+    THE SPINE (U2, FR-2.1..FR-2.6). Unlike the blocking ``POST /workflows/runs``
+    (untouched, byte-compatible), this route acks with **202** the instant the run
+    is durably journaled, then drives the run in a fire-and-forget background task.
+    It upholds two invariants on the write side: ``run-id-allocated-before-ack``
+    (INV-1 — the durable insert is awaited and complete before the 202) and
+    no-orphan-RUNNING-row (validate/lint/reserved-mode/insert are ordered so no 202
+    or RUNNING row exists for a rejected run).
+
+    The steps run STRICTLY in order — reordering breaks one of the two invariants:
+
+    0. Key-shape validation THEN the admission gate, both for a caller-supplied id
+       and both BEFORE spec resolve (OR-4). A malformed ``body.run_id`` returns 400
+       and a colliding one returns 409, in each case even when ``name_or_path``
+       names a nonexistent spec — so neither is masked by a 404. Validating the key
+       shape HERE (not only inside the engine entry) is load-bearing: the prepared
+       background entries are reached only AFTER the durable insert and the 202, so
+       an engine-side ``_validate_key_part`` failure would surface as a background
+       task error on an already-acked run instead of the blocking twin's 400.
+    1. Resolve the spec (same error mapping as the blocking route).
+    2. Mint or accept the run id (identical to the blocking route).
+    3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
+    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode -> 501 (OR-3) —
+       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
+    5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
+       aborts with 500 and NO 202. This is the one deliberate deviation from the
+       engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
+       (it is an ``Error`` subclass, so arm order is load-bearing) and maps to
+       409: it means a concurrent submit won the race for this run id, which is
+       the same collision step 0 reports as 409 when it can see it serially.
+    6. Register the tier-appropriate in-process record (the SAME record C2 drives).
+    7. Schedule the background drive through ``_schedule_background_drive`` — the
+       registry helper, NOT a bare ``asyncio.create_task`` (see BG-1 at step 7).
+    8. Return 202 ``{run_id, state:"running", links}``.
+    """
+    import sqlite3
+    import uuid
+
+    from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+    from cli_agent_orchestrator.models.workflow import (
+        NotBuiltYetError,
+        ScriptSpec,
+        TierCollisionError,
+    )
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+    from cli_agent_orchestrator.services import (
+        script_runner,
+        workflow_journal,
+        workflow_service,
+        workflow_spec_service,
+    )
+
+    # --- Step 0: admission gate FIRST for a caller-supplied id (OR-4) ---
+    # BEFORE spec resolve, so a colliding id + nonexistent spec returns 409, not
+    # 404. A minted id has no step-0 gate (collision probability negligible; the
+    # atomic insert's IntegrityError is the backstop).
+    #
+    # TWO checks, in the SAME order the blocking twin runs them (workflow_service
+    # .start_run L795-796): FORMAT first (_validate_key_part -> 400), then
+    # UNIQUENESS (_check_run_id_available -> 409). Both are required here because
+    # the async path's prepared engine entry (``start_run_prepared``) is the
+    # drive-only tail of ``start_run`` — it deliberately re-runs NO admission, so
+    # it never validates the key. Without this line the twins split their contract:
+    # the same malformed id yields 400 on POST /workflows/runs and 202 here, and a
+    # durable journal row commits for a run that can never execute while the caller
+    # holds a run_id and a ``links`` block that will never resolve. (Nothing escapes
+    # onto disk either way — ``step_output_store`` re-validates both key parts at
+    # its own boundary, L129-130 — so this is a contract defect, not traversal.)
+    if body.run_id:
+        try:
+            workflow_service._validate_key_part(body.run_id, "run_id")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            workflow_service._check_run_id_available(body.run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    # --- Step 1: resolve the spec (mapping identical to the blocking route) ---
+    try:
+        spec = workflow_spec_service.get_workflow(body.name_or_path)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown workflow '{body.name_or_path}'",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # --- Step 2: mint or accept the run id (identical to the blocking route) ---
+    run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+
+    # --- Step 3: validate + cap inputs BEFORE any create (OR-1, NFR-4). No row
+    # yet — a validation failure never leaves an orphan RUNNING row. ---
+    try:
+        resolved = workflow_service._validate_inputs(spec, body.inputs)
+        payload = json.dumps(resolved, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+            raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    started_at = workflow_service._now()
+    record: Any
+    tier: str
+
+    # Steps 4-6 branch by tier via ONE ``isinstance`` check (mirrors the blocking
+    # route's tier split). Each arm: (4) its pre-insert gate, which raises BEFORE
+    # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
+    # HARD durable insert; (6) the in-process record C2 will drive.
+    if isinstance(spec, ScriptSpec):
+        # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
+        # in the handler's validation phase (never deferred into the background
+        # task, where a 202 + RUNNING row would already exist).
+        lint_result = script_runner.lint_script(spec.source, spec.path)
+        if lint_result.status == "fail":
+            raise HTTPException(
+                status_code=422,
+                detail={"findings": workflow_spec_service.render_findings(lint_result.findings)},
+            )
+        spec_snapshot = json.dumps(
+            {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
+        )
+        # Step 5 — the script row is a single INSERT (no seed steps), already
+        # atomic on its own connection. This is the one deliberate deviation from
+        # the engines' best-effort write: awaited, and its failure aborts with 500.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run,
+                run_id,
+                spec.name,
+                spec_snapshot,
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                "script",
+                "1",
+            )
+        except sqlite3.IntegrityError:
+            # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
+            # not one atomic operation, so two concurrent submits carrying the SAME
+            # caller-supplied run_id can both pass step 0. The loser's PRIMARY KEY
+            # violation is the same collision step 0 reports as 409 when it sees it
+            # serially, so it must answer 409 too — a 500 would tell the caller the
+            # server broke when in fact their run id was simply taken. Ordered BEFORE
+            # the generic arm: IntegrityError is a sqlite3.Error subclass.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live script record.
+        record = script_runner.ScriptRunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at=started_at,
+            finished_at=None,
+            tier="script",
+        )
+        tier = "script"
+    else:
+        # Step 4 — reserved-mode guard (OR-3): the prepared YAML entry skips the
+        # blocking path's pre-drive reserved-mode rejection, so the handler runs it
+        # here and maps NotBuiltYetError -> 501 pre-journal.
+        if spec.mode != "sequential":
+            try:
+                workflow_service._dispatch_reserved_mode(spec)
+            except NotBuiltYetError as e:
+                raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # Step 5 — the awaited HARD ATOMIC durable insert (INV-1, TR-1): the run row
+        # AND its seeded step rows commit in ONE transaction, so a failure leaves
+        # NEITHER (no phantom RUNNING row). Its failure aborts with 500 + NO 202.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run_with_steps,
+                run_id,
+                spec.name,
+                spec.model_dump_json(),
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                [(step.id, StepState.PENDING.value) for step in spec.steps],
+                started_at,
+                "yaml",
+                "1",
+            )
+        except sqlite3.IntegrityError:
+            # Same TOCTOU → 409 mapping as the script arm above; ordered before the
+            # generic sqlite3.Error arm because IntegrityError subclasses it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live YAML record (step_states seeded from spec.steps).
+        record = workflow_service.RunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            spec=spec,
+            inputs=resolved,
+            state=RunState.RUNNING,
+            current_step_id=None,
+            cancelled=False,
+            step_states={
+                step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
+            },
+            started_at=started_at,
+        )
+        tier = "yaml"
+
+    workflow_service.run_registry[run_id] = record
+
+    # --- Step 7: schedule the fire-and-forget background drive (C2). ---
+    # Via the registry helper, NOT a bare create_task: the Task must be strongly
+    # referenced or it can be collected mid-drive (BG-1), and the drive itself is
+    # admission-bounded (AB-1) inside the task.
+    _schedule_background_drive(record, spec, run_id, tier, resolved)
+
+    # --- Step 8: ack 202. The insert (step 5) is awaited and durable before this,
+    # so the instant this returns, get_run(run_id) finds the row (INV-1). ---
+    return {"run_id": run_id, "state": RunState.RUNNING.value, "links": _run_links(run_id)}
+
+
 @app.get("/workflows/runs/{run_id}")
 async def get_workflow_run_endpoint(run_id: str) -> Dict:
     """Return a point-in-time status snapshot for a run (FR-5.5)."""
@@ -2278,6 +3747,224 @@ async def get_workflow_run_endpoint(run_id: str) -> Dict:
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
     return status_snapshot.model_dump()
+
+
+def _json_or_none(output_json: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse a persisted step ``output_json`` blob, degrading a corrupt value to
+    ``None`` rather than failing the whole result (U4, RR-3).
+
+    Per-row corruption tolerance mirroring
+    ``workflow_service._rebuild_record_from_journal``'s ``_record_from_json``: a
+    single unparseable OR non-object ``output_json`` yields ``None`` for that one
+    step's output (``StepResult.output`` is an ``Optional[Dict]``), never a 500 for
+    the entire run result.
+    """
+    if output_json is None:
+        return None
+    try:
+        data = json.loads(output_json)
+    except (ValueError, TypeError):
+        logger.debug("result assembly: dropping unparseable step output_json")
+        return None
+    if not isinstance(data, dict):
+        logger.debug("result assembly: dropping non-object step output_json")
+        return None
+    return data
+
+
+def _durable_error_kind(steps: List[Any]) -> Optional[str]:
+    """Read the durable ``error_kind`` off the step projection, if present (U9, RP-1).
+
+    The column-first swap target (ADR-5): #504 persists a durable ``error_kind`` on
+    the ``workflow_run_step`` projection. Once that column lands and ``StepRow``
+    surfaces it, this returns the first non-null durable kind found on a step —
+    authoritative over any inference (RP-1). Until then, ``StepRow`` carries no
+    ``error_kind`` attribute, so ``getattr`` yields ``None`` for every row and this
+    helper is INERT (returns ``None``), leaving the inference floor in force (RP-2).
+
+    Reading via ``getattr(step, "error_kind", None)`` makes the rebase a clean swap
+    confined to this one helper (RP-5): when the column arrives no call site changes.
+    """
+    # TODO(#504-rebase): prefer durable step.error_kind once the column lands — the
+    # getattr below activates automatically the moment StepRow surfaces the field.
+    for s in steps:
+        durable = getattr(s, "error_kind", None)
+        if durable:
+            return str(durable)
+    return None
+
+
+def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
+    """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
+
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    function with column-first precedence (kept a single module-level function so
+    the swap is confined, RP-5). Precedence:
+
+    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
+       authoritatively — the inference is NOT consulted. INERT until #504's column
+       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
+    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+
+       - CANCELLED run                                 -> ``"cancelled"``
+       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
+       - FAILED run otherwise                          -> ``"error"``
+       - COMPLETED / RUNNING / anything else           -> ``None``
+
+    The timeout branch is a conservative case-insensitive substring match, never a
+    parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    try:
+        run_state = RunState(row.state)
+    except ValueError:
+        return None
+
+    if run_state == RunState.CANCELLED:
+        return "cancelled"
+    if run_state == RunState.FAILED:
+        for s in steps:
+            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+                return "timeout"
+        return "error"
+    return None
+
+
+def _build_failure_envelope(
+    row: Any, step_results: List[Any], run_id: str, error_kind: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Assemble the FR-7.1 failure envelope from journal state (U9, EF-1..EF-5).
+
+    A presentation value object — NOT a persisted entity (EF-5). Returned only for a
+    terminal-failed/cancelled run; a completed/non-terminal run yields ``None`` so a
+    successful run's result stays byte-identical (NFR-3 stable ``--json``). Assembled
+    purely from ``get_run`` + ``get_steps`` state, so it is answerable on the
+    detached / post-restart path with no live registry entry (JP-1, FR-6.2). Fields:
+
+    - ``failing_step`` — the first ``StepResult`` whose state is FAILED, else the
+      run's ``current_step_id`` at failure (EF-1).
+    - ``attempt`` — that step's ``attempts`` (EF-2).
+    - ``error_kind`` — the ``_resolve_error_kind`` result (already resolved).
+    - ``terminal_reference`` — the ``run_id`` (the durable handle, EF-3).
+    - ``next_command`` — a fixed literal hint keyed on the run id (EF-4, ST-1); the
+      shape does not drift, so ``--json`` consumers can parse it across releases.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+
+    if row.state not in (RunState.FAILED.value, RunState.CANCELLED.value):
+        return None
+
+    failed = next((s for s in step_results if s.state == StepState.FAILED), None)
+    if failed is not None:
+        failing_step: Optional[str] = failed.id
+        attempt: Optional[int] = failed.attempts
+    else:
+        # No FAILED step (e.g. a cancelled run) — fall back to the live step at
+        # failure and read its attempt count when that row is present (EF-1/EF-2).
+        failing_step = row.current_step_id
+        match = next((s for s in step_results if s.id == failing_step), None)
+        attempt = match.attempts if match is not None else None
+
+    return {
+        "failing_step": failing_step,
+        "attempt": attempt,
+        "error_kind": error_kind,
+        "terminal_reference": run_id,
+        "next_command": f"cao workflow result {run_id}",
+    }
+
+
+@app.get("/workflows/runs/{run_id}/result")
+async def get_workflow_run_result_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the complete retained ``WorkflowRunResult`` for a run (U4, FR-7.2).
+
+    A two-segment path (safe at any declaration position, RO-2). Journal-authoritative
+    (FR-6.2, A-5): the result is assembled purely from ``get_run`` + ``get_steps``,
+    with NO dependency on a live ``run_registry`` entry — so a detached or
+    post-restart run's full retained result is still answerable (RR-2). An absent
+    run (``get_run`` is ``None``) is a 404 (RR-1). A single corrupt step
+    ``output_json`` degrades to ``output=None`` for that step, not a 500 for the
+    whole result (RR-3). ``kind`` is resolved through the single
+    ``_resolve_error_kind`` seam (RR-4).
+
+    U9 (FR-7.1): a terminal-FAILED/CANCELLED run additionally carries a
+    ``failure_envelope`` (failing step, attempt, error kind, terminal reference,
+    next-command hint), assembled from the same journal rows (JP-1). A
+    COMPLETED/non-terminal run omits the key, so a successful run's ``--json`` shape
+    stays byte-identical (NFR-3).
+
+    NOT returned (PR #525 review): a run-level ``output``. The journal has no column
+    for one, so the key was always null here; it is dropped rather than advertised.
+    Per-step outputs are unaffected and still populate ``steps[].output``. A caller
+    that needs a script run's run-level output must use the blocking
+    ``POST /workflows/runs``, whose live return path carries it.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import (
+        RunState,
+        StepResult,
+        StepState,
+        WorkflowRunResult,
+    )
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    steps = workflow_journal.get_steps(run_id)
+    step_results = [
+        StepResult(
+            id=s.step_id,
+            state=StepState(s.state),
+            attempts=s.attempts,
+            output=_json_or_none(s.output_json),
+            error=s.error,
+        )
+        for s in steps
+    ]
+    error_kind = _resolve_error_kind(row, steps)
+    result = WorkflowRunResult(
+        run_id=row.run_id,
+        workflow_name=row.workflow_name,
+        state=RunState(row.state),
+        steps=step_results,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        kind=error_kind,
+    )
+    body = result.model_dump()
+
+    # PR #525 review: DROP the run-level ``output`` key from this route's body.
+    # It was advertised in three places but STRUCTURALLY always None here: there is
+    # no run-level output column on ``workflow_run`` and ``RunRow`` has no such
+    # field, so a journal-assembled result has nothing to populate it from. (Only
+    # the LIVE script-tier return path fills it — ``script_runner._finalize`` — which
+    # the blocking route still returns, so the model field stays.) The pop is
+    # explicit because Pydantic's ``model_dump`` emits defaulted fields: simply not
+    # passing ``output=`` above leaves the key present as null, which is exactly the
+    # false advertisement being removed. Advertising a field that can never carry a
+    # value is worse than omitting it — a client feature-detecting on key presence
+    # wires up a code path that can never fire.
+    body.pop("output", None)
+
+    # U9 (FR-7.1): attach the failure envelope ONLY for a terminal-failed/cancelled
+    # run (a completed/non-terminal run keeps its byte-identical shape, NFR-3). The
+    # envelope is assembled from journal state alone (JP-1), so it is present on the
+    # detached / post-restart path with an empty registry.
+    envelope = _build_failure_envelope(row, step_results, run_id, error_kind)
+    if envelope is not None:
+        body["failure_envelope"] = envelope
+    return body
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
@@ -2297,6 +3984,13 @@ async def cancel_workflow_run_endpoint(
     row CANCELLED directly rather than calling ``cancel_run`` (which would
     unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
     as a 404).
+
+    U7 (issue #505, FR-9.1/FR-9.2) note: this is the route the 202 submit body's
+    ``links.cancel`` (built by ``_run_links``) points at — the SAME acknowledged
+    run id round-trips back here. It is the ONLY cancel handler; U7 adds no new
+    route (NR-1). The registry-miss journal-fallback arm above is what makes a
+    detached async-submitted run, or one whose registry entry was lost to a
+    restart, still cancellable from the journal alone (journal-is-authoritative).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
@@ -2407,6 +4101,28 @@ async def resume_workflow_run_endpoint(
 # which raise KeyError for an unregistered name (mapped to 404 here).
 
 
+async def _project_graph_with_timeout(
+    inst: GraphProvider,
+    filters: Dict[str, Any],
+    *,
+    provider: str,
+    timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
+) -> GraphView:
+    try:
+        return await asyncio.wait_for(inst.project(**filters), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "message": f"graph projection timed out after {timeout_s:g} seconds",
+                "kind": "graph_projection_timeout",
+                "timeout_s": timeout_s,
+                "provider": provider,
+                "metadata": {"graph_projection_timeout": True},
+            },
+        )
+
+
 @app.get("/graph/{provider}")
 async def get_graph_endpoint(
     provider: str,
@@ -2457,7 +4173,7 @@ async def get_graph_endpoint(
             detail=f"unknown graph provider '{provider}'",
         )
     try:
-        view = await inst.project(**filters)
+        view = await _project_graph_with_timeout(inst, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return view.to_dict()
@@ -2494,7 +4210,7 @@ async def export_graph_endpoint(
         )
 
     try:
-        view = await prov.project(**filters)
+        view = await _project_graph_with_timeout(prov, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2657,9 +4373,12 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no authentication.
-    It is intended for localhost-only use. Do NOT expose the server to
-    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access with no bearer/token
+    authentication. It is intended for localhost-only use and is gated by two
+    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
+    for browser callers, the ``Origin`` header must be in the trusted set
+    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
+    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -2675,6 +4394,32 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         and client_host not in WS_ALLOWED_CLIENTS
     ):
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
+        return
+
+    # Cross-site WebSocket hijacking (CWE-1385) guard. The loopback IP check
+    # above is NOT sufficient: a WebSocket opened by JavaScript on any site the
+    # victim visits originates from the victim's own browser, so its peer is
+    # 127.0.0.1 and it passes the IP allowlist. Unlike fetch(), the browser's
+    # Same-Origin Policy does not block the connection, and Starlette's
+    # CORSMiddleware never sees the WebSocket ASGI scope — so without this the
+    # attacker page gets full PTY control (keystroke injection = RCE, plus
+    # read-back of everything the terminal renders). The browser attaches an
+    # Origin header (and a Host it cannot forge) on every cross-site handshake,
+    # so accept the connection only when it is same-origin with the request
+    # Host — the request the bundled viewer makes, and the one an attacker page
+    # cannot spoof — or when the Origin is in the explicit allowlists. In the
+    # default config the same-origin match is DNS-rebinding-safe because
+    # TrustedHostMiddleware validates Host against ALLOWED_HOSTS on this same
+    # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
+    # is_ws_origin_allowed).
+    origin = websocket.headers.get("origin")
+    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
+            terminal_id,
+            origin,
+        )
+        await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
 
     await websocket.accept()
@@ -3151,6 +4896,185 @@ async def export_memories_endpoint(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Memory relationship routes (issue #511).
+#
+# Registered BEFORE the single-segment ``/memory/{key}`` catch-all below so the
+# literal ``/memory/relationships`` collection is not captured as a key (FR-5.2;
+# same precedent as ``/memory/export`` above). A route-resolution test guards
+# this ordering. All go through the single MemoryRelationshipService; the route
+# layer is a thin adapter that maps ValueError -> 400 and not-found -> 404 and
+# never issues SQL. Responses are content-free RelationshipDTOs (NFR-1.7).
+# --------------------------------------------------------------------------- #
+
+
+class RelationshipCreateRequest(BaseModel):
+    scope: str
+    scope_id: Optional[str] = None
+    source_key: str
+    target_key: str
+    type: str
+    origin: str
+    status: str = "active"
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+class RelationshipPatchRequest(BaseModel):
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+def _relationship_service():
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    return MemoryRelationshipService()
+
+
+@app.get("/memory/relationships")
+async def list_relationships_endpoint(
+    scope: str,
+    scope_id: Optional[str] = None,
+    source_key: Optional[str] = None,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    stale: bool = False,
+    limit: int = Query(default=50, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """List relationships (read scope). Default returns ACTIVE only; ``status``
+    widens; ``stale=true`` filters to stale edges. Each row is a content-free
+    RelationshipDTO exposing provenance/status/timestamps (FR-5.4, AC-7).
+
+    ``limit`` bounds the response, matching ``GET /memory``'s precedent
+    (default 50, max 100). This route previously returned every row in the
+    scope, so a large scope could emit an unbounded payload where every sibling
+    memory list route was already capped (human review, PR #524)."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    dtos = svc.list_relationships(
+        scope,
+        scope_id,
+        source_key,
+        status=status_filter,
+        stale_only=stale,
+        include_non_active=status_filter is not None,
+    )
+    return [d.to_dict() for d in dtos[:limit]]
+
+
+@app.post("/memory/relationships")
+async def create_relationship_endpoint(
+    body: RelationshipCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Create/upsert a relationship (write scope). Fail-closed: the service
+    rejects invalid type/status/confidence/attributes, self-links, and
+    cross-scope/dangling endpoints with ValueError -> 400, before persistence."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.create(
+            body.scope,
+            body.scope_id,
+            body.source_key,
+            body.target_key,
+            body.type,
+            body.origin,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return dto.to_dict()
+
+
+@app.patch("/memory/relationships/{relationship_id}")
+async def patch_relationship_endpoint(
+    relationship_id: str,
+    body: RelationshipPatchRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.patch(
+            relationship_id,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        # not-found is raised as ValueError by the service; map to 404, other
+        # validation errors to 400.
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/promote")
+async def promote_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.promote(relationship_id)
+    except ValueError as e:
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/reject")
+async def reject_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.reject(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
+
+
+@app.delete("/memory/relationships/{relationship_id}")
+async def delete_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Soft-delete (write scope): status -> deleted, row retained (auditable).
+
+    WRITE, not ADMIN, is DELIBERATE (human review, PR #524). The ADMIN-gated
+    memory routes destroy user content irreversibly (a memory's file and its
+    metadata row); this one only transitions a derived annotation's status and
+    retains the row, so it is recoverable and forensically intact — the same
+    authority already needed to CREATE the edge via POST, and no more. Gating it
+    ADMIN would also make ordinary curation (rejecting a bad compiler edge)
+    require an admin token while writing one did not, which is the wrong
+    asymmetry. Note this is the SOFT delete; the hard purge is not exposed over
+    HTTP at all — it is driven internally by ``forget()``."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.soft_delete(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
+
+
 @app.get("/memory/{key}", response_model=MemoryDetail)
 async def get_memory_endpoint(
     key: MemoryKey,
@@ -3275,6 +5199,90 @@ async def clear_memories_endpoint(
         except Exception as e:
             logger.warning("Failed to delete memory %r during clear: %s", mem.key, e)
     return {"success": True, "deleted_count": deleted_count}
+
+
+# =============================================================================
+# Workflow outcome endpoints (self-learning Phase 1)
+# =============================================================================
+
+
+class OutcomeCreateBody(BaseModel):
+    session_name: str
+    task_label: str
+    success: bool
+    workflow_name: Optional[str] = None
+    agent_profile: Optional[str] = None
+    source_terminal_id: Optional[str] = None
+    score: Optional[int] = None
+    friction_notes: str = ""
+
+
+def _require_learning_enabled() -> None:
+    """Raise 404 when workflow self-learning is disabled.
+
+    list_outcomes() silently returns [] when disabled, so the gate must be
+    explicit rather than inferred from empty results (same reasoning as
+    ``_require_memory_enabled``).
+    """
+    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+    if not is_learning_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+
+
+@app.post("/outcomes")
+async def create_outcome_endpoint(
+    body: OutcomeCreateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Record a workflow outcome (self-learning signal)."""
+    from cli_agent_orchestrator.services.outcome_service import (
+        LearningDisabledError,
+        OutcomeService,
+    )
+
+    _require_learning_enabled()
+    try:
+        outcome = OutcomeService().record_outcome(
+            session_name=body.session_name,
+            task_label=body.task_label,
+            success=body.success,
+            workflow_name=body.workflow_name,
+            agent_profile=body.agent_profile,
+            source_terminal_id=body.source_terminal_id,
+            score=body.score,
+            friction_notes=body.friction_notes,
+        )
+    except LearningDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"success": True, "outcome": outcome}
+
+
+@app.get("/outcomes")
+async def list_outcomes_endpoint(
+    session_name: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    workflow_name: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List recorded workflow outcomes newest-first (retrospector read path)."""
+    from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+    _require_learning_enabled()
+    outcomes = OutcomeService().list_outcomes(
+        session_name=session_name,
+        agent_profile=agent_profile,
+        workflow_name=workflow_name,
+        limit=limit,
+    )
+    return {"outcomes": outcomes, "count": len(outcomes)}
 
 
 # Static file serving for built web UI.

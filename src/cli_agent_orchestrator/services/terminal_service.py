@@ -19,11 +19,13 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import os
+import re
 import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -33,7 +35,10 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    list_siblings_by_group_prefix,
     update_last_active,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
@@ -42,7 +47,9 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
@@ -51,7 +58,14 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    KiroPhase0KASError,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
+)
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -68,6 +82,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +172,12 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -185,6 +206,27 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        engine: Explicit Kiro engine. For Kiro, it must agree with the selected
+            profile's engine when both are present; omitted resolves to v2.
+        kiro_capability_probe: Optional test seam for the bounded wrapper probe.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the agent profile's own static `model` field. Lets a caller
+            (e.g. MCP handoff/assign's own `model` parameter) pin a specific
+            model for one worker without needing a dedicated agent profile.
+            None = behavior unchanged (profile.model, if any, still applies).
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
 
     Returns:
         Terminal object with all metadata populated
@@ -193,6 +235,7 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -202,7 +245,68 @@ async def create_terminal(
     # new one, but had no equivalent for a window added to a session that
     # already existed — see the `except` block.
     window_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
+        # Resolve profile policy and Kiro engine BEFORE allocating any backend
+        # resource. A KAS request must probe then fail closed with no window,
+        # database row, FIFO, Herdr registration, or provider process.
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        # Production loaders return AgentProfile. Treat a test double or an
+        # otherwise malformed object as no selected profile rather than
+        # accepting arbitrary attributes as configuration.
+        if profile is not None and not isinstance(profile, AgentProfile):
+            profile = None
+
+        if provider == ProviderType.KIRO_CLI.value:
+            resolved_engine = resolve_kiro_engine(
+                explicit=engine,
+                profile=getattr(profile, "engine", None),
+            )
+            if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            # Kiro runs headlessly, so current CAO behavior always bypasses its
+            # interactive approval prompt. Profile/MCP policy remains enforced
+            # by CAO, while unrestricted profiles additionally force legacy UI.
+            # Mirror the launch-time precedence (`model or profile.model`, see
+            # _get_profile_model): probing the profile snapshot alone would let an
+            # explicit override launch --model on a wrapper never probed for it.
+            requested = requested_kiro_capabilities(
+                resolved_engine,
+                model=model or (profile.model if profile else None),
+                yolo=True,
+            )
+            probe = kiro_capability_probe or probe_kiro_capabilities
+            await asyncio.to_thread(probe, resolved_engine, requested)
+            if resolved_engine == KiroEngine.KAS:
+                raise KiroPhase0KASError(
+                    bool(profile and (profile.allowedTools or profile.toolsSettings))
+                )
+        else:
+            if engine is not None:
+                raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+            resolved_engine = None
+
+        # Resolve tool policy before persistence for non-Kiro providers too.
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
@@ -210,6 +314,28 @@ async def create_terminal(
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
+
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -257,29 +383,15 @@ async def create_terminal(
             )
             window_created = True  # only set after successful creation
 
-        # Step 3: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
+        # Step 3: Build a runtime skill catalog only for providers that consume
+        # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
             build_skill_catalog(profile.skills if profile else None)
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             else None
         )
 
-        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None and profile is not None:
-            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-            allowed_tools = resolve_allowed_tools(
-                profile.allowedTools, profile.role, mcp_server_names
-            )
-
-        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # Step 3b: Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
         # mechanism (kimi runs --yolo; restrictions are prompt-level text
         # only), so a restricted policy on them is advisory, not enforced.
         # Surface that loudly at launch so operators route restricted or
@@ -303,6 +415,9 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            engine=resolved_engine.value if resolved_engine is not None else None,
+            group=group,
+            metadata=metadata,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -355,7 +470,8 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=profile.model if profile else None,
+            model=model or (profile.model if profile else None),
+            engine=resolved_engine,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -399,7 +515,10 @@ async def create_terminal(
             agent_profile=agent_profile,
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            engine=resolved_engine,
             shell_command=shell_command,
+            group=group,
+            metadata=metadata,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -433,15 +552,18 @@ async def create_terminal(
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
         try:
-            fifo_manager.stop_reader(terminal_id)
+            if terminal_id is not None:
+                fifo_manager.stop_reader(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            status_monitor.clear_terminal(terminal_id)
+            if terminal_id is not None:
+                status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            provider_manager.cleanup_provider(terminal_id)
+            if terminal_id is not None:
+                provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
@@ -451,7 +573,8 @@ async def create_terminal(
         # before the row was written. Runs regardless of session_created so a
         # pre-existing session keeps its live terminals but loses the dead row.
         try:
-            db_delete_terminal(terminal_id)
+            if terminal_id is not None:
+                db_delete_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if session_created and session_name:
@@ -481,6 +604,18 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
+        if worktree_repo_root is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
 
 
@@ -543,6 +678,156 @@ def _notify_caller_of_deferred_failure(
             )
 
 
+# --- deferred-init submit verification ----------------------------------------
+# send_input delivers via paste-buffer → fixed sleep → Enter (clients/tmux.py).
+# That fixed sleep only guesses when the TUI is input-ready; when it guesses
+# wrong the Enter (or the whole paste) is dropped and the message sits
+# unsubmitted in the prompt box. In the deferred-init path nobody blocks on
+# completion, so a dropped submit leaves the worker IDLE forever with the task
+# never started and NO exception raised — the supervisor then waits on a
+# callback that can never arrive. Confirm the worker actually began processing
+# and re-submit if it did not.
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
+# Statuses proving the worker accepted the task (left the ready IDLE state).
+# WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
+_DEFERRED_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
+
+
+def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+    """Direct visible-screen status check bypassing the event-driven status cache.
+
+    The deferred-init retry loop polls ``status_monitor.get_status()`` which
+    returns the **cached** status updated only by the event-driven pipeline
+    (pyte screener at rising-edge/quiescence edges). When that lags behind
+    reality the cached status stays IDLE even though the worker already
+    transitioned to PROCESSING.
+
+    This function does a live ``capture-pane`` to grab the visible screen
+    (not the 8 KB rolling buffer, which is too small to reliably hold the
+    footer) and calls ``provider.get_status()`` directly, catching the real
+    state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        session_name = metadata.get("tmux_session")
+        window_name = metadata.get("tmux_window")
+        if not session_name or not window_name:
+            return False
+        output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
+    except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
+    return status in _DEFERRED_STARTED_STATUSES
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the delivered message is still sitting in the input box.
+
+    Decides the resubmit action: if our text is there the paste landed and only
+    the Enter was dropped (send a bare Enter); if it is absent the paste itself
+    was dropped (re-deliver the full message). Guessing wrong the other way must
+    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
+    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
+    unicode punctuation in the rendered box can't defeat the match.
+    """
+    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
+    if len(probe) < 8:
+        # Too short to match reliably — treat as "not shown" so we re-deliver
+        # in full rather than risk a blank submit.
+        return False
+    try:
+        rendered = get_output(terminal_id)
+    except Exception:
+        return False
+    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+async def _confirm_worker_started_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    sender_id: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    provider=None,
+) -> bool:
+    """Confirm a deferred-init worker began processing; re-submit if not.
+
+    Returns True once the terminal reaches a started status, False if it is
+    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
+    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    """
+    if await wait_until_status(
+        terminal_id,
+        _DEFERRED_STARTED_STATUSES,
+        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+        polling_interval=0.5,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        # The cached status_monitor status is event-driven (pyte screener at
+        # rising-edge/quiescence only) and can lag behind reality. Before
+        # re-delivering, do a direct capture-pane / visible-screen check via
+        # the provider to catch cases where the worker IS processing but the
+        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
+        # footer appearing between pyte detection edges). Only providers that
+        # opt in via ``supports_direct_status_probe = True`` take this path.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+                return True
+
+        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
+            logger.warning(
+                "Deferred assign to %s unsubmitted (Enter swallowed); "
+                "re-submitting via Enter (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
+        else:
+            logger.warning(
+                "Deferred assign to %s not accepted (paste dropped); "
+                "re-delivering message (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(
+                send_input,
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+        if await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        ):
+            return True
+
+    return False
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -592,6 +877,37 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=orchestration_type,
                 )
+                # Delivery can be silently dropped (Enter swallowed / paste lost)
+                # when the TUI isn't input-ready. Confirm the worker actually
+                # started and re-submit if not; if it never starts, surface the
+                # failure so the supervisor re-routes instead of waiting forever.
+                started = await _confirm_worker_started_or_resubmit(
+                    terminal_id,
+                    initial_message,
+                    registry,
+                    caller_id,
+                    orchestration_type,
+                    provider=provider_instance,
+                )
+                if not started:
+                    logger.error(
+                        "Deferred init for %s: worker never started after "
+                        "resubmits; task not delivered — notifying caller and "
+                        "tearing down.",
+                        terminal_id,
+                    )
+                    await asyncio.to_thread(
+                        _notify_caller_of_deferred_failure,
+                        terminal_id,
+                        (
+                            f"Worker {terminal_id} received the assigned task but "
+                            f"never started processing (input not accepted after "
+                            f"retries). It has been deleted — re-assign the task."
+                        ),
+                        registry,
+                        True,  # delete_worker
+                    )
+                    return
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -660,6 +976,9 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "engine": metadata.get("engine"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -667,6 +986,82 @@ def get_terminal(terminal_id: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
@@ -716,24 +1111,42 @@ def send_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        if (
+            metadata.get("provider") == ProviderType.KIRO_CLI.value
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+        ):
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (
             orchestration_type.value
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+
+            # Guard: refuse to type into a terminal whose provider process has
+            # exited. Without this check, queued messages would be pasted into
+            # a bare shell and executed as arbitrary commands.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
@@ -891,8 +1304,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
     accumulated from the FIFO pipeline), which is bounded to the most recent
-    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
-    only when that buffer is empty. This is a deliberate trade-off in the
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
     event-driven architecture (instant, no tmux call) — it is *not* unbounded
     scrollback, so very long sessions are truncated to the tail. Use the
     on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``
@@ -1064,6 +1478,22 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -1084,9 +1514,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
@@ -1120,6 +1548,30 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+
+            # issue #100 Phase 1: if this terminal was worktree-backed (its live
+            # cwd matched the CAO-managed worktree path shape), remove the
+            # worktree + branch now that the process using it is gone.
+            # `remove_worktree` is itself best-effort/never-raises, matching
+            # every other step in this teardown.
+            #
+            # The parsed terminal_id MUST match the terminal actually being
+            # deleted here, not just "some" CAO worktree path. Without this
+            # guard: a worktree-backed terminal A (cwd
+            # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+            # working_directory explicitly set to A's cwd (handoff/assign
+            # both accept an explicit working_directory, and "here" -- the
+            # caller's own directory -- is a common choice). Deleting B --
+            # including handoff's automatic success teardown -- would then
+            # read B's pane cwd (== A's worktree path), parse terminal_id
+            # "A" out of it, and force-remove A's still-running worktree.
+            # Mismatched parses now fall through as a no-op leak (Phase 3
+            # territory) instead of destroying another terminal's checkout.
+            parsed = worktree_service.parse_worktree_path(live_working_directory)
+            if parsed is not None:
+                worktree_repo_root, worktree_terminal_id = parsed
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
