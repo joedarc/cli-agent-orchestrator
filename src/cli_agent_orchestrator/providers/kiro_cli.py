@@ -396,9 +396,16 @@ class KiroCliProvider(BaseProvider):
                 self._engine,
                 self._agent_profile,
                 model=model,
-                yolo=True,
+                yolo=False,
                 legacy_ui=True,
             )
+            # Append --trust-tools for non-yolo agents on the --legacy-ui retry,
+            # same as the primary TUI launch path.
+            if not yolo and self._allowed_tools:
+                from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
+                trust_tags = get_kiro_trust_tools(self._allowed_tools)
+                if trust_tags is not None:
+                    legacy_args.extend(["--trust-tools", trust_tags])
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)

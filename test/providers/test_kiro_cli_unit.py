@@ -40,7 +40,8 @@ class TestKiroCliProviderInitialization:
         mock_wait_status.return_value = True
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
-        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        # Use yolo (allowed_tools=['*']) — --trust-all-tools is only for unrestricted agents.
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer", allowed_tools=["*"])
         result = await provider.initialize()
 
         assert result is True
@@ -48,7 +49,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
         )
         mock_wait_status.assert_called_once()
 
@@ -96,6 +97,9 @@ class TestKiroCliProviderInitialization:
         mock_wait_status.side_effect = [False, True]
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
+        # Non-yolo: no allowed_tools, so no --trust-all-tools.
+        # TUI times out, falls back to --legacy-ui. No --trust-tools either
+        # since the profile declares no specific tools.
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         result = await provider.initialize()
 
@@ -106,13 +110,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -161,10 +165,11 @@ class TestKiroCliProviderInitialization:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         await provider.initialize()
 
+        # Non-yolo + model: no --trust-all-tools
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "kiro-cli chat --agent-engine v2 "
             "--model claude-opus-4-6 --agent developer",
         )
 
@@ -266,17 +271,18 @@ class TestKiroCliProviderInitialization:
 
         calls = mock_tmux.return_value.send_keys.call_args_list
         assert len(calls) == 3
+        # Non-yolo + model: no --trust-all-tools, model is preserved across fallback.
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "kiro-cli chat --agent-engine v2 "
             "--model claude-opus-4.6 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            "kiro-cli chat --agent-engine v2 --legacy-ui "
             "--model claude-opus-4.6 --agent developer",
         )
 

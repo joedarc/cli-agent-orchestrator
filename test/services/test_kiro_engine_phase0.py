@@ -180,7 +180,8 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
         )
 
     assert terminal.engine == KiroEngine.V2
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
+    # Non-yolo (no allowed_tools) does not probe for "trust" (--trust-all-tools).
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "ui"})
     assert providers.create_provider.call_args.kwargs["engine"] == KiroEngine.V2
     assert db_create.call_args.kwargs["engine"] == "v2"
 
@@ -268,7 +269,8 @@ async def test_non_yolo_v2_missing_legacy_ui_rejects_before_allocation():
     assert exc_info.value.kind == "unsupported_capability"
     assert exc_info.value.engine == KiroEngine.V2
     assert exc_info.value.capability == "--legacy-ui"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
+    # Non-yolo does not include "trust" in required capabilities.
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "ui"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
@@ -407,7 +409,8 @@ async def test_v2_agent_engine_value_exclusion_rejects_before_allocation():
     assert exc_info.value.kind == "unsupported_capability"
     assert exc_info.value.engine == KiroEngine.V2
     assert exc_info.value.capability == "--agent-engine=v2"
-    probe.assert_called_once_with(KiroEngine.V2, {"profile", "trust", "ui"})
+    # Non-yolo does not include "trust" in required capabilities.
+    probe.assert_called_once_with(KiroEngine.V2, {"profile", "ui"})
     backend.return_value.create_session.assert_not_called()
     backend.return_value.create_window.assert_not_called()
     db_create.assert_not_called()
