@@ -65,15 +65,19 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
-        let data = new Uint8Array(e.data)
-        // Remap Kiro's light diff background colors to darker equivalents
-        // so they're readable on a dark terminal background.
-        let str = new TextDecoder().decode(data)
-        str = str
-          .replace(/\x1b\[48;2;212;240;212m/g, '\x1b[48;2;30;60;30m')   // light green → dark green
-          .replace(/\x1b\[48;2;240;212;212m/g, '\x1b[48;2;60;25;25m')   // light pink → dark red
-          .replace(/\x1b\[48;2;238;238;238m/g, '\x1b[48;2;40;40;40m')   // light grey → dark grey
-        term.write(str)
+        if (provider === 'kiro_cli') {
+          // Remap Kiro's light diff background colors to darker equivalents
+          // so they're readable on a dark terminal background.
+          let str = new TextDecoder().decode(new Uint8Array(e.data))
+          str = str
+            .replace(/\x1b\[48;2;212;240;212m/g, '\x1b[48;2;30;60;30m')   // light green → dark green
+            .replace(/\x1b\[48;2;240;212;212m/g, '\x1b[48;2;60;25;25m')   // light pink → dark red
+            .replace(/\x1b\[48;2;238;238;238m/g, '\x1b[48;2;40;40;40m')   // light grey → dark grey
+          term.write(str)
+        } else {
+          // Pass raw bytes directly — no decode needed, xterm.js handles binary natively.
+          term.write(new Uint8Array(e.data))
+        }
       }
     }
 
@@ -81,12 +85,17 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       term.write('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n')
     }
 
-    // Copy selection to clipboard on mouse-up
+    // Copy selection to clipboard on mouse-up — debounced to avoid clipboard
+    // API calls on every character of a drag selection, which causes input lag.
+    let selectionTimer: ReturnType<typeof setTimeout>
     term.onSelectionChange(() => {
-      const selection = term.getSelection()
-      if (selection) {
-        navigator.clipboard.writeText(selection).catch(() => {})
-      }
+      clearTimeout(selectionTimer)
+      selectionTimer = setTimeout(() => {
+        const selection = term.getSelection()
+        if (selection) {
+          navigator.clipboard.writeText(selection).catch(() => {})
+        }
+      }, 200)
     })
 
     // Ctrl+Shift+C to copy selection
@@ -130,6 +139,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     return () => {
       cancelAnimationFrame(initialFit)
       clearTimeout(resizeTimer)
+      clearTimeout(selectionTimer)
       resizeObserver.disconnect()
       ws.close()
       term.dispose()

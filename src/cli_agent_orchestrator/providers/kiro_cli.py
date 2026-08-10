@@ -339,14 +339,29 @@ class KiroCliProvider(BaseProvider):
                 legacy_ui=True,
             )
         else:
-            # Current CAO policy always bypasses Kiro's interactive approval
-            # prompt; CAO still enforces the profile/MCP allowlist itself.
+            # Non-yolo: build the base command without --trust-all-tools, then
+            # append --trust-tools=<tags> derived from the agent's allowedTools
+            # so kiro pre-approves exactly those capabilities and hard-denies
+            # everything else — no hanging approval prompts, no bypassing
+            # permissions.yaml enforcement.
+            from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
+
             base_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
                 model=model,
-                yolo=True,
+                yolo=False,
             )
+
+            if self._allowed_tools:
+                trust_tags = get_kiro_trust_tools(self._allowed_tools)
+                if trust_tags is not None:
+                    # trust_tags is "" when no mappable tools — pass empty string
+                    # so kiro trusts nothing (hard-deny all without prompts).
+                    base_args.extend(["--trust-tools", trust_tags])
+                    logger.info(
+                        "kiro_cli: launching with --trust-tools=%s", trust_tags or "(none)"
+                    )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.

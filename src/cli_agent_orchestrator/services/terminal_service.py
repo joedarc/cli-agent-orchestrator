@@ -276,16 +276,18 @@ async def create_terminal(
                 allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
-            # Kiro runs headlessly, so current CAO behavior always bypasses its
-            # interactive approval prompt. Profile/MCP policy remains enforced
-            # by CAO, while unrestricted profiles additionally force legacy UI.
+            # Determine yolo from the resolved allowed_tools — mirrors the
+            # launch-time precedence in KiroCliProvider.initialize().
+            # Non-yolo agents use --trust-tools (not --trust-all-tools) so the
+            # capability probe must not require --trust-all-tools for them.
             # Mirror the launch-time precedence (`model or profile.model`, see
             # _get_profile_model): probing the profile snapshot alone would let an
             # explicit override launch --model on a wrapper never probed for it.
+            _probe_yolo = bool(allowed_tools and "*" in allowed_tools)
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=model or (profile.model if profile else None),
-                yolo=True,
+                yolo=_probe_yolo,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             await asyncio.to_thread(probe, resolved_engine, requested)
