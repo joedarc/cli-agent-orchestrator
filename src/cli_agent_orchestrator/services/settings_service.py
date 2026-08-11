@@ -431,6 +431,30 @@ def is_learning_enabled() -> bool:
         return False
 
 
+def is_kiro_legacy_ui_enabled() -> bool:
+    """Return True when all non-yolo kiro-cli agents should launch with --legacy-ui.
+
+    Opt-in per-server setting for users who prefer plain scrolling terminal
+    output over the interactive TUI. Set in settings.json:
+
+        { "kiro_legacy_ui": true }
+
+    or via environment variable:
+
+        CAO_KIRO_LEGACY_UI=true cao-server
+
+    Defaults to False (TUI mode). Fails closed on read errors.
+    """
+    env = os.environ.get("CAO_KIRO_LEGACY_UI")
+    if env is not None and env.strip() != "":
+        return env.strip().lower() in _BOOL_TRUE_VALUES
+    try:
+        return bool(_load().get("kiro_legacy_ui", False))
+    except Exception as e:
+        logger.warning(f"Failed to read kiro_legacy_ui, defaulting to False: {e}")
+        return False
+
+
 def is_instruction_promotion_enabled() -> bool:
     """Return True when learned-lesson promotion into profile files is enabled.
 

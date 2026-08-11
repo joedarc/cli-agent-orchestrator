@@ -345,12 +345,15 @@ class KiroCliProvider(BaseProvider):
             # everything else — no hanging approval prompts, no bypassing
             # permissions.yaml enforcement.
             from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
+            from cli_agent_orchestrator.services.settings_service import is_kiro_legacy_ui_enabled
 
+            _use_legacy_ui = is_kiro_legacy_ui_enabled()
             base_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
                 model=model,
                 yolo=False,
+                legacy_ui=_use_legacy_ui,
             )
 
             if self._allowed_tools:
@@ -392,6 +395,9 @@ class KiroCliProvider(BaseProvider):
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
             status_monitor.reset_buffer(self.terminal_id)
+            # If kiro_legacy_ui is already enabled, the TUI attempt above already
+            # used --legacy-ui, so the fallback is the same. If not, force it here
+            # since this is the explicit --legacy-ui retry path.
             legacy_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
