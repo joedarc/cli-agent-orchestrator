@@ -1,3 +1,4 @@
+import os
 """TmuxBackend — concrete TerminalBackend implementation wrapping TmuxClient.
 
 This backend delegates all operations to the existing TmuxClient, preserving
@@ -132,10 +133,15 @@ class TmuxBackend(TerminalBackend):
         """Attach to tmux session via subprocess (replaces current process)."""
         import subprocess
 
-        subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
+        _socket = os.environ.get("CAO_TMUX_SOCKET") or None
+        _cmd = ["tmux", "-L", _socket, "attach-session", "-t", session_name] if _socket else ["tmux", "attach-session", "-t", session_name]
+        subprocess.run(_cmd, check=True)
 
     def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
         """Return the tmux command used by the browser PTY WebSocket."""
+        _socket = os.environ.get("CAO_TMUX_SOCKET") or None
+        if _socket:
+            return ["tmux", "-L", _socket, "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
         return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
 
     # --- Pipe-pane ---

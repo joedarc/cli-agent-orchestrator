@@ -58,7 +58,15 @@ class TmuxClient:
     """Simplified tmux client for basic operations."""
 
     def __init__(self) -> None:
-        self.server = libtmux.Server()
+        import os
+        # CAO_TMUX_SOCKET allows workspace isolation by pointing CAO at a
+        # named tmux server instead of the default socket. Set automatically
+        # by cao-start when --home is passed; unset for the default workspace.
+        _socket_name = os.environ.get("CAO_TMUX_SOCKET") or None
+        self.server = libtmux.Server(socket_name=_socket_name)
+        # Base tmux command prefix — includes -L <socket> when a named server
+        # is active so all raw subprocess tmux calls target the same server.
+        self._tmux_cmd: list[str] = ["tmux", "-L", _socket_name] if _socket_name else ["tmux"]
 
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
@@ -194,7 +202,7 @@ class TmuxClient:
         command = "kill-window" if window_name is not None else "kill-session"
         try:
             result = subprocess.run(
-                ["tmux", command, "-t", target],
+                self._tmux_cmd + [command, "-t", target],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -231,7 +239,7 @@ class TmuxClient:
             return None
         try:
             result = subprocess.run(
-                ["tmux", "has-session", "-t", target],
+                self._tmux_cmd + ["has-session", "-t", target],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -675,12 +683,12 @@ class TmuxClient:
                 buf_content = keys.encode()
                 paste_args = ["-p"]
             subprocess.run(
-                ["tmux", "load-buffer", "-b", buf_name, "-"],
+                self._tmux_cmd + ["load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", *paste_args, "-b", buf_name, "-t", target],
+                self._tmux_cmd + ["paste-buffer", *paste_args, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
@@ -696,7 +704,7 @@ class TmuxClient:
                     # before the next Enter triggers form submission.
                     time.sleep(0.5)
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    self._tmux_cmd + ["send-keys", "-t", target, "Enter"],
                     check=True,
                 )
             logger.debug(f"Sent keys to {target}")
@@ -705,7 +713,7 @@ class TmuxClient:
             raise
         finally:
             subprocess.run(
-                ["tmux", "delete-buffer", "-b", buf_name],
+                self._tmux_cmd + ["delete-buffer", "-b", buf_name],
                 check=False,
             )
 
