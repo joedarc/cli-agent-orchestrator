@@ -398,15 +398,22 @@ def build_kiro_command(
     *,
     model: Optional[str] = None,
     yolo: bool = False,
-    legacy_ui: bool = False,
 ) -> list[str]:
-    """Build a deterministic Kiro command without executing it."""
+    """Build a deterministic Kiro command without executing it.
+
+    ``--legacy-ui`` is intentionally absent: on kiro-cli 2.x it conflicts with
+    ``--agent-engine=v2`` (hard error: "Conflicting options: --legacy-ui cannot
+    be used with --agent-engine=v2") and its bare form implicitly selects the
+    v1 engine, which exposes no MCP tools. Since all of CAO's orchestration
+    surface (assign/handoff/report_outcome) arrives over MCP, a v1 launch
+    yields an agent that starts cleanly and then cannot orchestrate — silently.
+    The trust-all-tools consent dialog is handled at runtime by
+    ``_wait_ready_accepting_trust_dialog`` instead.
+    """
     if engine == KiroEngine.KAS:
         command = ["kiro-cli", "--v3", "chat"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
-        if legacy_ui:
-            command.append("--legacy-ui")
         if yolo:
             command.append("--trust-all-tools")
     if model:
@@ -418,14 +425,10 @@ def build_kiro_command(
 def requested_kiro_capabilities(
     engine: KiroEngine, *, model: Optional[str], yolo: bool
 ) -> set[str]:
-    """Return every wrapper feature used by the launch and fallback lifecycle."""
+    """Return every wrapper feature used by the launch lifecycle."""
     requested = {"profile"}
     if model:
         requested.add("model")
-    if engine == KiroEngine.V2:
-        # Non-yolo launches may retry with --legacy-ui after a TUI startup
-        # timeout, so this flag must be verified before any allocation.
-        requested.add("ui")
-        if yolo:
-            requested.add("trust")
+    if engine == KiroEngine.V2 and yolo:
+        requested.add("trust")
     return requested

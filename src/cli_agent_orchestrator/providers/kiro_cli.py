@@ -309,51 +309,37 @@ class KiroCliProvider(BaseProvider):
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
         #
-        # UI mode selection:
-        # - Yolo (--trust-all-tools): kiro-cli 2.0.1 TUI blocks on an
-        #   interactive "Yes, I accept" consent dialog before the chat is
-        #   ready; only --legacy-ui/--classic/--no-interactive bypass it.
-        #   CAO drives kiro-cli headlessly, so we force --legacy-ui for yolo.
-        # - Non-yolo: use the default TUI (fall back to --legacy-ui on
-        #   timeout, preserving prior behavior for older kiro-cli versions).
+        # Note: --legacy-ui is intentionally NOT used. On kiro-cli 2.x it
+        # hard-conflicts with --agent-engine=v2 ("Conflicting options:
+        # --legacy-ui cannot be used with --agent-engine=v2"). The consent
+        # dialog that --legacy-ui used to suppress is handled at runtime by
+        # _wait_ready_accepting_trust_dialog instead.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
 
-        # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
-        # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
-        # assign/handoff). The proper fix is to configure trustedAgents in the
-        # agent's toolsSettings.subagent config, which allows specific agents
-        # to be spawned without prompting while preserving allowedTools
-        # enforcement. --trust-all-tools is only used in yolo mode where all
-        # restrictions are intentionally removed.
         if yolo:
-            logger.info(
-                "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
-                "shows a non-bypassable trust-all-tools consent dialog)"
-            )
+            # Yolo: pass --trust-all-tools so every tool invocation is
+            # pre-approved. The trust-all-tools consent dialog is auto-answered
+            # by _wait_ready_accepting_trust_dialog below.
             base_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
                 model=model,
                 yolo=True,
-                legacy_ui=True,
             )
         else:
-            # Non-yolo: build the base command without --trust-all-tools, then
-            # append --trust-tools=<tags> derived from the agent's allowedTools
-            # so kiro pre-approves exactly those capabilities and hard-denies
+            # Non-yolo: build without --trust-all-tools, then append
+            # --trust-tools=<tags> derived from the agent's allowedTools so
+            # kiro pre-approves exactly those capabilities and hard-denies
             # everything else — no hanging approval prompts, no bypassing
             # permissions.yaml enforcement.
             from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
-            from cli_agent_orchestrator.services.settings_service import is_kiro_legacy_ui_enabled
 
-            _use_legacy_ui = is_kiro_legacy_ui_enabled()
             base_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
                 model=model,
                 yolo=False,
-                legacy_ui=_use_legacy_ui,
             )
 
             if self._allowed_tools:
@@ -375,48 +361,12 @@ class KiroCliProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # _wait_ready_accepting_trust_dialog also auto-answers the
-        # --trust-all-tools startup consent dialog (see its docstring), which
-        # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
+        # --trust-all-tools startup consent dialog (see its docstring).
         if not await self._wait_ready_accepting_trust_dialog():
-            if yolo:
-                # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
-            # Non-yolo TUI mode failed — fall back to --legacy-ui
-            logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
-            # Exit the current session and start fresh with --legacy-ui
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            init_timeout = get_server_settings()["provider_init_timeout"]
-            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
-                raise TimeoutError(
-                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
-                )
-            # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
-            # against a clean buffer, not one still full of stale TUI marker bytes
-            # from the failed first attempt (which would otherwise time out too).
-            status_monitor.reset_buffer(self.terminal_id)
-            # If kiro_legacy_ui is already enabled, the TUI attempt above already
-            # used --legacy-ui, so the fallback is the same. If not, force it here
-            # since this is the explicit --legacy-ui retry path.
-            legacy_args = build_kiro_command(
-                self._engine,
-                self._agent_profile,
-                model=model,
-                yolo=False,
-                legacy_ui=True,
+            raise TimeoutError(
+                f"Kiro CLI initialization timed out waiting for the agent prompt "
+                f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
-            # Append --trust-tools for non-yolo agents on the --legacy-ui retry,
-            # same as the primary TUI launch path.
-            if not yolo and self._allowed_tools:
-                from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
-                trust_tags = get_kiro_trust_tools(self._allowed_tools)
-                if trust_tags is not None:
-                    legacy_args.extend(["--trust-tools", trust_tags])
-            legacy_command = shlex.join(legacy_args)
-            status_monitor.notify_input_sent(self.terminal_id)
-            get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not await self._wait_ready_accepting_trust_dialog():
-                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
@@ -424,21 +374,15 @@ class KiroCliProvider(BaseProvider):
     async def _wait_ready_accepting_trust_dialog(self) -> bool:
         """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
 
-        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
-        human at the terminal to answer per-tool permission prompts in headless
-        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
-        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
-        consent dialog *before* the chat prompt is interactive:
+        When a yolo agent launches with ``--trust-all-tools``, kiro-cli 2.1+
+        shows a one-time startup consent dialog *before* the chat prompt is
+        interactive:
 
             ❯ No, exit
               Yes, I accept
               Yes, and don't ask again
 
-        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
-        earlier "force --legacy-ui to skip it" workaround no longer helps and
-        init just times out on the dialog. This helper is applied to the
-        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
-        there as well it is handled without a version check. get_status()
+        get_status()
         classifies the dialog as WAITING_USER_ANSWER off generic selector
         chrome, so before answering we VERIFY the dialog body and the ❯ cursor
         line (fail closed on anything else), then select **"Yes, I accept"**

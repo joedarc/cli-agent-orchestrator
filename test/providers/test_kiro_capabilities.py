@@ -351,20 +351,21 @@ def test_probe_reports_distinct_execution_failures(runner, kind):
 
 
 def test_builds_explicit_v2_and_deterministic_kas_commands():
+    # yolo=True: --trust-all-tools, NO --legacy-ui (conflicts with --agent-engine=v2)
     assert build_kiro_command(
-        KiroEngine.V2, "developer", model="fixture-model", yolo=True, legacy_ui=True
+        KiroEngine.V2, "developer", model="fixture-model", yolo=True
     ) == [
         "kiro-cli",
         "chat",
         "--agent-engine",
         "v2",
-        "--legacy-ui",
         "--trust-all-tools",
         "--model",
         "fixture-model",
         "--agent",
         "developer",
     ]
+    # KAS path is unaffected
     assert build_kiro_command(KiroEngine.KAS, "developer") == [
         "kiro-cli",
         "--v3",

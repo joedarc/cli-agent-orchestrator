@@ -49,7 +49,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
         mock_wait_status.assert_called_once()
 
@@ -80,7 +80,7 @@ class TestKiroCliProviderInitialization:
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
-        with pytest.raises(TimeoutError, match="timed out with TUI and `--legacy-ui`"):
+        with pytest.raises(TimeoutError, match="timed out waiting for the agent prompt"):
             await provider.initialize()
 
     @pytest.mark.asyncio
@@ -88,49 +88,36 @@ class TestKiroCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    async def test_initialize_legacy_ui_fallback(
+    async def test_initialize_timeout_raises_immediately(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
     ):
-        """Test fallback to --legacy-ui when TUI initialization fails."""
+        """TUI init timeout raises immediately; no --legacy-ui fallback.
+
+        --legacy-ui hard-conflicts with --agent-engine=v2 on kiro-cli 2.x.
+        """
         mock_wait_shell.return_value = True
-        # First call (TUI) fails, second call (--legacy-ui) succeeds
-        mock_wait_status.side_effect = [False, True]
+        mock_wait_status.return_value = False
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
-        # Non-yolo: no allowed_tools, so no --trust-all-tools.
-        # TUI times out, falls back to --legacy-ui. No --trust-tools either
-        # since the profile declares no specific tools.
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        result = await provider.initialize()
 
-        assert result is True
-        # Should have sent /exit then --legacy-ui command
-        calls = mock_tmux.return_value.send_keys.call_args_list
-        assert len(calls) == 3  # TUI command, /exit, legacy command
-        assert calls[0].args == (
-            "test-session",
-            "window-0",
-            "kiro-cli chat --agent-engine v2 --agent developer",
-        )
-        assert calls[1].args == ("test-session", "window-0", "/exit")
-        assert calls[2].args == (
-            "test-session",
-            "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --agent developer",
-        )
+        with pytest.raises(TimeoutError, match="timed out waiting for the agent prompt"):
+            await provider.initialize()
+
+        assert mock_tmux.return_value.send_keys.call_count == 1
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    async def test_initialize_yolo_forces_legacy_ui_with_trust_all_tools(
+    async def test_initialize_yolo_uses_trust_all_tools_no_legacy_ui(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
     ):
-        """--yolo (allowed_tools=['*']) must launch directly with --legacy-ui + --trust-all-tools.
+        """--yolo (allowed_tools=['*']) passes --trust-all-tools, never --legacy-ui.
 
-        kiro-cli 2.0.1 TUI shows a non-bypassable trust-all-tools consent
-        dialog; yolo headless launches must skip the TUI attempt entirely.
+        --legacy-ui conflicts with --agent-engine=v2 on kiro-cli 2.x. The
+        consent dialog is auto-answered at runtime instead.
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -144,7 +131,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -221,7 +208,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --model claude-opus-4.6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -245,7 +232,7 @@ class TestKiroCliProviderInitialization:
             "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
         )
 
-        with pytest.raises(TimeoutError, match="timed out with --legacy-ui"):
+        with pytest.raises(TimeoutError, match="timed out waiting for the agent prompt"):
             await provider.initialize()
 
         # Only one launch attempt — no /exit, no second launch.
@@ -256,12 +243,12 @@ class TestKiroCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    async def test_initialize_non_yolo_legacy_ui_fallback_preserves_model(
+    async def test_initialize_non_yolo_with_model_no_legacy_ui(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
     ):
-        """Non-yolo TUI timeout → --legacy-ui fallback must preserve --model."""
+        """Non-yolo + profile.model: single launch with --model, no --legacy-ui, no fallback."""
         mock_wait_shell.return_value = True
-        mock_wait_status.side_effect = [False, True]
+        mock_wait_status.return_value = True
         profile = Mock()
         profile.model = "claude-opus-4.6"
         mock_load_profile.return_value = profile
@@ -270,20 +257,11 @@ class TestKiroCliProviderInitialization:
         await provider.initialize()
 
         calls = mock_tmux.return_value.send_keys.call_args_list
-        assert len(calls) == 3
-        # Non-yolo + model: no --trust-all-tools, model is preserved across fallback.
+        assert len(calls) == 1
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 "
-            "--model claude-opus-4.6 --agent developer",
-        )
-        assert calls[1].args == ("test-session", "window-0", "/exit")
-        assert calls[2].args == (
-            "test-session",
-            "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui "
-            "--model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --model claude-opus-4.6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -362,17 +340,18 @@ class TestKiroCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    async def test_initialize_dialog_answered_but_prompt_times_out_falls_back(
+    async def test_initialize_dialog_answered_but_prompt_times_out_raises(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
     ):
-        """Answering the dialog but never reaching the prompt triggers --legacy-ui.
+        """Answering the consent dialog but then timing out on the prompt raises TimeoutError.
 
-        First wait → WAITING (verified, answered); second (post-accept) wait
-        times out; the --legacy-ui relaunch's wait then succeeds.
+        No --legacy-ui fallback exists (it conflicts with --agent-engine=v2).
+        The dialog is answered (Down+Enter), but if the post-accept wait times
+        out the initialization fails with a clear error.
         """
         mock_wait_shell.return_value = True
-        # main: WAITING (answered) → post-accept times out; legacy relaunch: IDLE.
-        mock_wait_status.side_effect = [True, False, True]
+        # First wait → WAITING (consent dialog, answered); second (post-accept) times out.
+        mock_wait_status.side_effect = [True, False]
         mock_status_monitor.get_status.side_effect = [
             TerminalStatus.WAITING_USER_ANSWER,
             TerminalStatus.IDLE,
@@ -381,14 +360,15 @@ class TestKiroCliProviderInitialization:
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        result = await provider.initialize()
 
-        assert result is True
-        # Dialog answered (Down+Enter), then /exit + --legacy-ui relaunch.
+        with pytest.raises(TimeoutError, match="timed out waiting for the agent prompt"):
+            await provider.initialize()
+
+        # Dialog was answered with Down+Enter before the timeout.
         special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
         assert special_keys[:2] == ["Down", "Enter"]
-        commands = [c.args[2] for c in mock_tmux.return_value.send_keys.call_args_list]
-        assert "--legacy-ui" in commands[-1]
+        # No /exit or second launch — just the single initial command.
+        assert mock_tmux.return_value.send_keys.call_count == 1
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")

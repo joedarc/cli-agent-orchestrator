@@ -139,21 +139,24 @@ class TestNonYoloLaunchCommands:
         assert "--trust-tools" in cmd
 
     @pytest.mark.asyncio
-    async def test_yolo_still_uses_trust_all_tools_and_legacy_ui(self, mock_deps):
-        """Yolo (allowedTools=['*']) still gets --trust-all-tools + --legacy-ui."""
+    async def test_yolo_uses_trust_all_tools_no_legacy_ui(self, mock_deps):
+        """Yolo (allowedTools=['*']) gets --trust-all-tools but NOT --legacy-ui.
+
+        --legacy-ui conflicts with --agent-engine=v2 on kiro-cli 2.x.
+        """
         mock_backend, _ = mock_deps
         provider = KiroCliProvider("t", "s", "w", "developer", allowed_tools=["*"])
         await provider.initialize()
 
         cmd = mock_backend.return_value.send_keys.call_args.args[2]
         assert "--trust-all-tools" in cmd
-        assert "--legacy-ui" in cmd
+        assert "--legacy-ui" not in cmd
 
     @pytest.mark.asyncio
-    async def test_legacy_ui_fallback_preserves_trust_tools(self, mock_deps):
-        """TUI timeout → --legacy-ui fallback must carry --trust-tools on the retry."""
+    async def test_trust_tools_present_on_single_launch(self, mock_deps):
+        """--trust-tools is applied on the single TUI launch; no --legacy-ui fallback."""
         mock_backend, mock_status = mock_deps
-        mock_status.side_effect = [False, True]
+        mock_status.return_value = True
 
         provider = KiroCliProvider(
             "t", "s", "w", "coder",
@@ -162,11 +165,8 @@ class TestNonYoloLaunchCommands:
         await provider.initialize()
 
         calls = mock_backend.return_value.send_keys.call_args_list
-        assert len(calls) == 3  # TUI, /exit, --legacy-ui
-        tui_cmd = calls[0].args[2]
-        legacy_cmd = calls[2].args[2]
-        assert "--trust-all-tools" not in tui_cmd
-        assert "--trust-tools" in tui_cmd
-        assert "--trust-all-tools" not in legacy_cmd
-        assert "--trust-tools" in legacy_cmd
-        assert "--legacy-ui" in legacy_cmd
+        assert len(calls) == 1
+        cmd = calls[0].args[2]
+        assert "--trust-all-tools" not in cmd
+        assert "--trust-tools" in cmd
+        assert "--legacy-ui" not in cmd
