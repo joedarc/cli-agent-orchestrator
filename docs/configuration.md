@@ -152,6 +152,39 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
 | `learning_enabled` | `false` | Opt-in switch for workflow self-learning (outcome capture via `report_outcome` / `/outcomes`). Requires `enabled=true` — a disabled memory subsystem forces learning off. Env override: `CAO_MEMORY_LEARNING_ENABLED`. See [Self-Learning](self-learning.md). |
 | `instruction_promotion_enabled` | `false` | Opt-in switch for promoting reinforced lessons into agent profile files (`cao memory promote --apply`). Requires `learning_enabled=true` (promotion ⊂ learning ⊂ memory). Env override: `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`. ⚠️ Promoted lesson text is agent-generated: review every promote diff as an untrusted-instruction change before applying — see [Self-Learning](self-learning.md#phase-2--instruction-promotion). |
+| `workflow_journal_capture_output` | `false` | ⚠️ **Security-relevant opt-in, but narrower than it sounds — read the note below this table.** Governs exactly two surfaces: the **event log's** output digest, and the **diagnostics bundle's** output excerpts. Turning it ON adds step output text to those two. It does **not** control the `workflow_run_step` projection, which retains output unconditionally either way. Retained text is size-capped (below) and cleaned through the shared `audit_log` sanitizer — transport hygiene (control-character stripping, size limiting), **not** secret redaction: a credential in a step's output is retained verbatim. |
+| `workflow_journal_output_cap_bytes` | `8192` | Per-output byte cap applied when `workflow_journal_capture_output` is on; anything longer is truncated with the shared `[…truncated]` marker. Deliberately above `audit_log`'s 4 KiB per-field cap because a worker step's output is materially larger than a single audit field. Must be `>= 1`. |
+| `workflow_journal_retention_days` | `30` | Age bound for the startup retention sweep: a run whose `started_at` is older than this many days is pruned (run row, steps, events, and seq high-water, in one cascade). **`0` DISABLES the age bound** (unlimited) — it does not mean "expire everything". Must be `>= 0`. |
+| `workflow_journal_retention_count` | `100` | Run-count bound for the same sweep: runs beyond the most-recent N are pruned. Pruning is the **union** of the two bounds — whichever matches a run first removes it. **`0` DISABLES the count bound** (unlimited) — it does not mean "keep zero runs"; both bounds at `0` makes the sweep a no-op. To remove a specific run, use `DELETE /workflows/runs/{id}` instead. Must be `>= 0`. |
+
+> #### ⚠️ Step output is retained regardless of `workflow_journal_capture_output`
+>
+> Turning that flag **off does not stop the journal from storing step output.** The
+> `workflow_run_step` projection persists each step's full `output_json` and `error`
+> text on every state transition, unconditionally, because the resume path and
+> `{{steps.<id>.output.<field>}}` templating read them back — gating them would
+> break both. The flag governs only the event-log output digest and the diagnostics
+> bundle's excerpts.
+>
+> That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
+> protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that
+> requirement is **inert unless you enable authentication**: with `CAO_AUTH_ENABLED`
+> unset — the default — the dependency returns the full scope set and enforces
+> nothing. A default local CAO server therefore serves step output and error text to
+> anything that can reach its port.
+>
+> Practical consequences:
+>
+> - Treat a step's output and error text as **retained and readable**, not as gated
+>   by a setting. A credential echoed by a step is stored verbatim and returned
+>   verbatim; the `audit_log` sanitizer caps size and strips control characters, it
+>   does not detect secrets.
+> - To limit exposure, enable auth (so the scope gate becomes real), keep the
+>   retention bounds tight, and delete runs you no longer need with
+>   `DELETE /workflows/runs/{run_id}`.
+> - An earlier revision of this table claimed the journal stored "execution metadata
+>   only … never prompt text or step output" when the flag was off. That was wrong in
+>   the security-relevant direction and is corrected above.
 
 ### Terminal backend (`terminal`)
 
@@ -199,9 +232,19 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
 | `CAO_WS_ALLOWED_ORIGINS` | `WS_ALLOWED_ORIGINS` (extra browser `Origin`s permitted to attach to the PTY WebSocket) | Serving the terminal viewer from a page whose origin **differs** from the cao-server host (a separate reverse-proxy hostname or dashboard). |
 
-> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+> **Security note:** an accepted WebSocket PTY connection grants full
+> read/write access to a running agent terminal. When authentication is enabled
+> by `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN`, attachment requires a valid bearer
+> token granting `cao:write` or `cao:admin`. These are existing CAO scopes;
+> `cao:read` alone is not sufficient. With neither variable set, no token is
+> required. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS`,
+> and do not expose the endpoint to untrusted networks. Authentication does
+> not replace the client-IP or Origin checks, and widening either allowlist
+> does not bypass authentication. See the [Auth settings](#auth-auth--env-var-only)
+> and [PTY WebSocket contract](api.md#pty-websocket) for configuration, token
+> transports, and refusal outcomes.
 >
-> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — work with no configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
+> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — pass this Origin check without extra Origin configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). Passing that check does not bypass the token requirement when authentication is enabled. `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
 
 ### Auth (`auth`) — env-var only
 

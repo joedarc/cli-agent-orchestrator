@@ -17,6 +17,7 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import asyncio
 import logging
 import re
 import shlex
@@ -309,18 +310,21 @@ class KiroCliProvider(BaseProvider):
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
         #
-        # Note: --legacy-ui is intentionally NOT used. On kiro-cli 2.x it
-        # hard-conflicts with --agent-engine=v2 ("Conflicting options:
-        # --legacy-ui cannot be used with --agent-engine=v2"). The consent
-        # dialog that --legacy-ui used to suppress is handled at runtime by
+        # UI mode: always the default TUI. --legacy-ui is NOT an option:
+        # it conflicts with --agent-engine=v2 and silently drops to the v1
+        # engine (no MCP tools). The consent dialog is auto-answered by
         # _wait_ready_accepting_trust_dialog instead.
+        #
+        # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
+        # blocks assign/handoff. The fix is trustedAgents in toolsSettings —
+        # --trust-all-tools is only used in yolo mode (allowed_tools=['*']).
+        # Non-yolo agents get --trust-tools=<tags> derived from allowedTools,
+        # so kiro hard-denies unlisted tools without hanging approval prompts.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
 
         if yolo:
-            # Yolo: pass --trust-all-tools so every tool invocation is
-            # pre-approved. The trust-all-tools consent dialog is auto-answered
-            # by _wait_ready_accepting_trust_dialog below.
+            # Yolo: pass --trust-all-tools; consent dialog auto-answered below.
             base_args = build_kiro_command(
                 self._engine,
                 self._agent_profile,
@@ -328,11 +332,8 @@ class KiroCliProvider(BaseProvider):
                 yolo=True,
             )
         else:
-            # Non-yolo: build without --trust-all-tools, then append
-            # --trust-tools=<tags> derived from the agent's allowedTools so
-            # kiro pre-approves exactly those capabilities and hard-denies
-            # everything else — no hanging approval prompts, no bypassing
-            # permissions.yaml enforcement.
+            # Non-yolo: derive --trust-tools from allowedTools so kiro
+            # pre-approves exactly those capabilities and hard-denies the rest.
             from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
 
             base_args = build_kiro_command(
@@ -360,8 +361,9 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        # _wait_ready_accepting_trust_dialog also auto-answers the
-        # --trust-all-tools startup consent dialog (see its docstring).
+        # _wait_ready_accepting_trust_dialog auto-answers the trust consent
+        # dialog if shown. There is no --legacy-ui retry: it conflicts with
+        # --agent-engine=v2, and a bare retry drops to v1 (no MCP tools).
         if not await self._wait_ready_accepting_trust_dialog():
             raise TimeoutError(
                 f"Kiro CLI initialization timed out waiting for the agent prompt "
@@ -416,7 +418,10 @@ class KiroCliProvider(BaseProvider):
         # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
         # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
         # stray message). Low probability given the sticky latch, but explicit.
-        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+        # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+        # terminal (status_monitor.py's stale-PROCESSING fallback).
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
             return True
 
         # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,

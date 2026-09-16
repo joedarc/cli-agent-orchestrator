@@ -8,6 +8,11 @@ unknown run/spec, 400 invalid inputs, 409 cancel-of-finished, 501 reserved mode,
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 from cli_agent_orchestrator.models.workflow import (
@@ -283,6 +288,94 @@ def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env):
     assert script_run_env["spy"]["inputs"] == {"topic": "birds"}
 
 
+def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
+    """A script approval refusal is actionable rather than an internal error."""
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import approval_gate, script_runner
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _refuse(spec_arg, inputs, run_id):
+        raise approval_gate.PlanApprovalRequiredError(
+            "Plan 'plan-v1:blocked' has not been approved.",
+            plan_id="plan-v1:blocked",
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _refuse)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "approval-refusal"},
+    )
+
+    assert response.status_code == 403
+    assert "plan-v1:blocked" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monkeypatch):
+    """The blocking script start leaves the event loop schedulable while freezing."""
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import manifest_freeze, script_runner
+
+    probe_started = threading.Event()
+    same_loop_sentinel = threading.Event()
+    release_probe = threading.Event()
+    observed = {}
+    event_loop_thread_id = threading.get_ident()
+
+    def blocking_manifest(*, source_hash, inputs):
+        observed["manifest_thread_id"] = threading.get_ident()
+        probe_started.set()
+        observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
+        assert release_probe.wait(timeout=1)
+        return '{"plan_id":"plan-v1:offloaded"}'
+
+    async def advance_same_loop() -> None:
+        while not probe_started.is_set():
+            await asyncio.sleep(0)
+        same_loop_sentinel.set()
+
+    async def _drive(record, path, env):
+        return _result()
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(script_runner.workflow_journal, "insert_run", lambda *args: None)
+    monkeypatch.setattr(script_runner, "_drive_process", _drive)
+
+    run_task = asyncio.create_task(script_runner.run_script_workflow(spec, {}, "manifest-blocking"))
+    sentinel_task = asyncio.create_task(advance_same_loop())
+    while not probe_started.is_set():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_probe.set()
+
+    await run_task
+    await sentinel_task
+
+    assert observed["manifest_thread_id"] != event_loop_thread_id
+    assert observed["sentinel_ran_while_blocked"] is True
+
+
 # ---------------------------------------------------------------------------
 # U2 (issue #505) — the async submission spine: POST /workflows/runs:submit
 # ---------------------------------------------------------------------------
@@ -361,18 +454,29 @@ def test_submit_202_shape_and_unconditional_links(client, async_yaml_env):
     assert links["status"] == "/workflows/runs/async-1"
 
 
-def test_submit_omits_events_link_when_route_absent(client, async_yaml_env):
-    """CD-1: with no events route registered (this branch's actual state), the 202
-    body carries NO ``events`` role — a ``links`` map is a capability advertisement,
-    and an advertised role that 404s is worse than an absent one.
+def test_submit_omits_events_link_when_route_absent(client, async_yaml_env, monkeypatch):
+    """CD-1: when the events route is NOT served, the 202 body carries NO ``events``
+    role — a ``links`` map is a capability advertisement, and an advertised role that
+    404s is worse than an absent one.
+
+    POST-#504-MERGE: this branch now DOES serve ``/workflows/runs/{run_id}/events``,
+    so the absent-route direction can no longer be observed by asserting on the real
+    route table (its precondition ``not _events_route_registered()`` was true only
+    pre-merge). The absent direction still has to be covered — it is the behaviour
+    that fires on any build where the route is missing — so the predicate is forced
+    False here.
+
+    This is the ONE place stubbing the predicate is correct: the paired test below
+    proves ``_EVENTS_ROUTE_PATH`` really matches a route #504 declares, which is the
+    thing a stub would otherwise hide. Here we exercise ``_run_links``' branch, not
+    the predicate.
 
     MUTATION PROOF: make ``_run_links`` add ``events`` unconditionally and this goes
     RED.
     """
     from cli_agent_orchestrator.api import main as api_main
 
-    # Precondition: this build really does not serve the route (guards against the
-    # test passing for the wrong reason once #504 merges — see the paired test).
+    monkeypatch.setattr(api_main, "_events_route_registered", lambda: False)
     assert not api_main._events_route_registered()
 
     resp = client.post(
@@ -383,51 +487,41 @@ def test_submit_omits_events_link_when_route_absent(client, async_yaml_env):
 
 
 def test_submit_includes_events_link_when_route_registered(client, async_yaml_env):
-    """CD-1, the other direction: once the route IS served (post-#504-merge), the
+    """CD-1, the other direction: now that the route IS served (post-#504-merge), the
     link reappears with NO code change — the check reads the live route table.
 
-    This is what makes the conditional self-healing rather than a hard-coded
-    omission needing a follow-up edit at the rebase.
+    That is what made the conditional self-healing rather than a hard-coded omission
+    needing a follow-up edit at the rebase, and this run is the proof: the ``events``
+    role below is produced by the SHIPPED predicate seeing #504's REAL route.
 
-    Registers a REAL route on the app and lets the SHIPPED predicate decide, rather
-    than monkeypatching ``_events_route_registered`` to True. Stubbing the predicate
-    would make this test pass even if ``_EVENTS_ROUTE_PATH`` did not match any route
-    #504 actually declares — the exact condition that must hold at the rebase, and
-    the one thing this test exists to prove. Proven necessary: corrupting
-    ``_EVENTS_ROUTE_PATH`` to an unmatchable string left the stubbed version GREEN.
+    Pre-merge this test had to register a stand-in route, because the real one did not
+    exist yet; the stand-in was declared with a hard-coded literal path (never via
+    ``_EVENTS_ROUTE_PATH``) so that corrupting the constant could not leave it GREEN.
+    The stand-in is now DELETED rather than kept: asserting against the genuine route
+    is strictly stronger, and re-registering a duplicate path would shadow #504's real
+    handler for anything reached through the shared app. The constant-correctness check
+    survives below as the explicit route-table assertion — corrupting
+    ``_EVENTS_ROUTE_PATH`` to an unmatchable string still turns this RED.
     """
     from cli_agent_orchestrator.api import main as api_main
 
-    async def _stand_in_events_route(run_id: str):  # pragma: no cover - never called
-        return []
+    # #504's real route must be present in the live table at exactly the path the
+    # constant names. This is the assertion the stand-in used to stand in for.
+    assert api_main._EVENTS_ROUTE_PATH == "/workflows/runs/{run_id}/events"
+    assert any(
+        getattr(r, "path", None) == "/workflows/runs/{run_id}/events" for r in api_main.app.routes
+    ), "#504's events route is missing from the live route table"
+    assert api_main._events_route_registered(), (
+        "the shipped predicate must SEE a route registered at _EVENTS_ROUTE_PATH "
+        "— if this fails, the path constant does not match a real route shape"
+    )
 
-    # The path is written as a LITERAL, deliberately NOT via _EVENTS_ROUTE_PATH: this
-    # is the contract with #504's route (its api/main.py declares exactly
-    # "/workflows/runs/{run_id}/events"). Registering via the constant would make the
-    # test move in lockstep with the constant, so corrupting the constant would leave
-    # this GREEN — which is exactly what happened on the first attempt. Hard-coding
-    # the real path is what makes the constant's correctness testable at all.
-    api_main.app.get("/workflows/runs/{run_id}/events")(_stand_in_events_route)
-    try:
-        assert api_main._events_route_registered(), (
-            "the shipped predicate must SEE a route registered at _EVENTS_ROUTE_PATH "
-            "— if this fails, the path constant does not match a real route shape"
-        )
-        resp = client.post(
-            "/workflows/runs:submit",
-            json={"name_or_path": "wf", "inputs": {}, "run_id": "async-ev"},
-        )
-        assert resp.status_code == 202
-        assert resp.json()["links"]["events"] == "/workflows/runs/async-ev/events"
-    finally:
-        api_main.app.routes[:] = [
-            r
-            for r in api_main.app.routes
-            if getattr(r, "endpoint", None) is not _stand_in_events_route
-        ]
-    # Post-cleanup: the app is back to having no events route, so this test cannot
-    # leak a registered route into any later test's view of the route table.
-    assert not api_main._events_route_registered()
+    resp = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "wf", "inputs": {}, "run_id": "async-ev"},
+    )
+    assert resp.status_code == 202
+    assert resp.json()["links"]["events"] == "/workflows/runs/async-ev/events"
 
 
 def test_submit_run_id_allocated_before_ack(client, async_yaml_env):
@@ -772,6 +866,107 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
             break
     assert final == "completed"
     assert async_script_env["prepared"]["called"] is True
+
+
+def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env, monkeypatch):
+    """The async script manifest, journal, and drive share resolved inputs."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.models.workflow import InputDecl
+    from cli_agent_orchestrator.services import manifest_freeze, workflow_spec_service
+
+    resolved_inputs = {"topic": "default topic"}
+    spec = async_script_env["spec"].model_copy(
+        update={"inputs": {"topic": InputDecl(type="string", default="default topic")}}
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        workflow_spec_service, "get_workflow", lambda name_or_path, scan_dir=None: spec
+    )
+
+    def _capture_manifest(*, source_hash, inputs):
+        captured["manifest_inputs"] = inputs
+        return '{"plan_id":"plan-v1:resolved-inputs"}'
+
+    def _capture_schedule(record, spec_arg, run_id, tier, inputs):
+        captured["scheduled_inputs"] = inputs
+
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", _capture_schedule)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "async-resolved-inputs"},
+    )
+
+    assert response.status_code == 202
+    assert captured["manifest_inputs"] == resolved_inputs
+    assert (
+        json.loads(workflow_journal.get_run("async-resolved-inputs").inputs_json) == resolved_inputs
+    )
+    assert captured["scheduled_inputs"] == resolved_inputs
+
+
+@pytest.mark.asyncio
+async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkeypatch):
+    """The submit script start leaves the event loop schedulable while freezing."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import (
+        manifest_freeze,
+        script_runner,
+        workflow_spec_service,
+    )
+
+    probe_started = threading.Event()
+    same_loop_sentinel = threading.Event()
+    release_probe = threading.Event()
+    observed = {}
+    event_loop_thread_id = threading.get_ident()
+
+    def blocking_manifest(*, source_hash, inputs):
+        observed["manifest_thread_id"] = threading.get_ident()
+        probe_started.set()
+        observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
+        assert release_probe.wait(timeout=1)
+        return '{"plan_id":"plan-v1:offloaded"}'
+
+    async def advance_same_loop() -> None:
+        while not probe_started.is_set():
+            await asyncio.sleep(0)
+        same_loop_sentinel.set()
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name_or_path: spec)
+    monkeypatch.setattr(workflow_service, "_validate_inputs", lambda spec, inputs: inputs)
+    monkeypatch.setattr(workflow_service, "_now", lambda: "2026-01-01T00:00:00Z")
+    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
+    )
+    monkeypatch.setattr(api_main.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(workflow_journal, "insert_run", lambda *args: None)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args: None)
+
+    body = api_main.WorkflowRunRequest(name_or_path="scr", inputs={}, run_id="manifest-submit")
+    submit_task = asyncio.create_task(api_main.submit_workflow_run_endpoint(body, []))
+    sentinel_task = asyncio.create_task(advance_same_loop())
+    while not probe_started.is_set():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    release_probe.set()
+
+    response = await submit_task
+    await sentinel_task
+
+    assert response["state"] == "running"
+    assert observed["manifest_thread_id"] != event_loop_thread_id
+    assert observed["sentinel_ran_while_blocked"] is True
 
 
 def test_submit_script_lint_fail_422_no_row(client, async_script_env):
@@ -1592,25 +1787,44 @@ def test_resolve_error_kind_column_first_precedence_when_present():
     assert _resolve_error_kind(_FakeRow(RunState.FAILED.value), inferred_steps) == "error"
 
 
-def test_durable_error_kind_inert_on_real_steprow_today():
-    """U9 (#504-rebase guard): today's ``StepRow`` has NO ``error_kind`` attribute,
-    so ``_durable_error_kind`` is INERT (returns None) and the inference floor is in
-    force. This pins the pre-rebase behavior; it flips to column-first the moment
-    #504's column + ``StepRow`` field land, with no call-site change (RP-5)."""
+def test_durable_error_kind_is_column_first_after_504_merge():
+    """U9 (RP-1/RP-5), FLIPPED at the #504 merge as its own docstring predicted.
+
+    Pre-merge this test pinned the inert direction: ``StepRow`` had no
+    ``error_kind`` attribute, so ``_durable_error_kind`` returned None and the
+    inference floor was in force. Issue #504 landed the durable
+    ``workflow_run_step.error_kind`` column AND surfaced it on ``StepRow``, so the
+    ``getattr`` in ``_durable_error_kind`` now activates — exactly the "no call-site
+    change" swap RP-5 designed for. Both directions are asserted so the helper
+    cannot silently regress to inert:
+
+    - a row carrying a durable kind resolves to THAT kind (column-first), and
+    - a row whose durable column is NULL still yields None, leaving the inference
+      floor in force for pre-U1 rows (RP-2).
+    """
     from cli_agent_orchestrator.api.main import _durable_error_kind
     from cli_agent_orchestrator.services.workflow_journal import StepRow
 
-    row = StepRow(
-        run_id="r",
-        step_id="s1",
-        state="failed",
-        attempts=1,
-        output_json=None,
-        error="boom",
-        updated_at="t",
-    )
-    assert not hasattr(row, "error_kind")
-    assert _durable_error_kind([row]) is None
+    def _row(**kw):
+        return StepRow(
+            run_id="r",
+            step_id="s1",
+            state="failed",
+            attempts=1,
+            output_json=None,
+            error="boom",
+            updated_at="t",
+            **kw,
+        )
+
+    # The field now EXISTS — this is the post-#504 half of the flip.
+    assert hasattr(_row(), "error_kind")
+
+    # Column-first: a durable kind is authoritative.
+    assert _durable_error_kind([_row(error_kind="provider_error")]) == "provider_error"
+
+    # NULL column -> still None, so inference remains the floor (RP-2).
+    assert _durable_error_kind([_row(error_kind=None)]) is None
 
 
 def test_failure_envelope_assembled_for_failed_run_from_journal(client, read_surface_db):
@@ -1636,6 +1850,26 @@ def test_failure_envelope_assembled_for_failed_run_from_journal(client, read_sur
     assert env["error_kind"] == "error"
     assert env["terminal_reference"] == "failrun"
     assert env["next_command"] == "cao workflow result failrun"
+
+
+def test_retained_result_surfaces_durable_run_error_as_warning(client, monkeypatch):
+    """Issue #753: the detached result must retain a failed script's diagnostic."""
+    row = SimpleNamespace(
+        run_id="script-fail",
+        workflow_name="wf",
+        state=RunState.FAILED.value,
+        current_step_id=None,
+        started_at="2026-09-09T00:00:00Z",
+        finished_at="2026-09-09T00:00:01Z",
+        error="Traceback: script failed",
+    )
+    monkeypatch.setattr(workflow_journal, "get_run", lambda run_id: row)
+    monkeypatch.setattr(workflow_journal, "get_steps", lambda run_id: [])
+
+    body = client.get("/workflows/runs/script-fail/result").json()
+
+    assert body["state"] == "failed"
+    assert body["warnings"] == ["Traceback: script failed"]
 
 
 def test_failure_envelope_timeout_kind_and_hint(client, read_surface_db):
@@ -1684,7 +1918,21 @@ def test_completed_run_result_has_no_failure_envelope(client, read_surface_db):
 def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
     """U9-T7 (EF-5): the envelope is a presentation projection — U9 introduces NO
     migration. The ``workflow_run_step`` column set is unchanged after a failed run's
-    result is assembled (the envelope never writes a column)."""
+    result is assembled (the envelope never writes a column).
+
+    The expected set below gained ``terminal_id``/``reprompted``/``error_kind`` from
+    #504's U1 additive columns and ``result_json`` from #583's ``result-envelope`` —
+    all four created by ``_migrate_workflow_run_step`` at init_db time, NOT by envelope
+    assembly. The assertion still carries its full force, because what it guards is
+    that assembling an envelope adds no column: the set is captured AFTER the result
+    call and must equal the migrated schema exactly, so an envelope-driven write would
+    still fail it.
+
+    NB the FAILURE envelope of U9 (a presentation projection, no column) is a different
+    thing from the #583 step RESULT envelope, which is persisted and did add exactly one
+    column, ``result_json``. This test's teeth are unchanged — assembling the U9 failure
+    envelope must still add nothing of its own.
+    """
     _seed_run(
         "nocol",
         RunState.FAILED.value,
@@ -1706,6 +1954,11 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        # #504 U1 additive columns (from the migration, not from the envelope).
+        "terminal_id",
+        "reprompted",
+        "error_kind",
+        "result_json",  # issue #583, result-envelope (BR-7) — not U9's
     }
 
 
