@@ -1262,10 +1262,18 @@ def _reconcile_terminals_at_startup() -> None:
                     )
                 else:
                     detected = provider.get_status(pane_output)
-                    if detected in (TerminalStatus.UNKNOWN, TerminalStatus.PROCESSING):
-                        # Pane is alive but we can't confirm IDLE — default to IDLE
-                        # so delivery is attempted. Worst case: message arrives while
-                        # agent is briefly processing; kiro queues it.
+                    if detected in (
+                        TerminalStatus.UNKNOWN,
+                        TerminalStatus.PROCESSING,
+                        TerminalStatus.WAITING_USER_ANSWER,
+                    ):
+                        # Pane is alive but status is ambiguous from scrollback —
+                        # default to IDLE so inbox delivery is unblocked. PROCESSING
+                        # and WAITING_USER_ANSWER can both be false positives when
+                        # reading captured scrollback (e.g. the kiro TUI's "esc to
+                        # cancel" processing footer matches the trust-dialog pattern).
+                        # Worst case: a message arrives while the agent is mid-turn;
+                        # kiro queues it automatically.
                         detected = TerminalStatus.IDLE
                     status_monitor._apply_detection(  # type: ignore[attr-defined]
                         terminal_id, detected
