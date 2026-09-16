@@ -1188,40 +1188,37 @@ def _reconcile_memory_at_startup() -> None:
 
 
 def _reconcile_terminals_at_startup() -> None:
-    """Seed the StatusMonitor for terminals that have pending inbox messages.
+    """Seed the StatusMonitor for all known terminals on server restart.
 
     When the CAO server restarts, the StatusMonitor loses its in-memory state.
-    Any terminal with PENDING inbox messages will never receive them because
-    deliver_pending() requires StatusMonitor to report IDLE/COMPLETED — but
-    the monitor returns UNKNOWN for all terminals it hasn't observed yet.
+    Any terminal whose supervisor is UNKNOWN will never receive send_message
+    callbacks because deliver_pending() requires IDLE/COMPLETED — the message
+    sits in the inbox queue forever even though the supervisor is alive.
 
-    This function finds every terminal with pending messages, checks whether
-    its tmux pane is still alive, and probes the pane to seed an initial status.
-    The existing inbox_reconciliation_daemon then handles actual delivery once
-    the StatusMonitor has a non-UNKNOWN status for the terminal.
+    This function seeds every terminal in the DB (not just ones with pending
+    messages) so the dashboard shows accurate status and inbox delivery works
+    immediately after restart, without waiting for each terminal to be poked.
 
     Best-effort: failures are logged and skipped, never blocking startup.
     """
     try:
         from cli_agent_orchestrator.clients.database import (
             list_all_terminals,
-            list_pending_receiver_ids_older_than,
         )
         from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.providers.manager import provider_manager
 
-        pending_ids = list_pending_receiver_ids_older_than(0)
-        if not pending_ids:
+        all_terminals_list = list_all_terminals()
+        if not all_terminals_list:
             return
 
         logger.info(
-            "Server restart detected %d terminal(s) with pending inbox messages — "
-            "seeding StatusMonitor",
-            len(pending_ids),
+            "Server restart: seeding StatusMonitor for %d terminal(s)",
+            len(all_terminals_list),
         )
-        all_terminals = {t["id"]: t for t in list_all_terminals()}
+        all_terminals = {t["id"]: t for t in all_terminals_list}
 
-        for terminal_id in pending_ids:
+        for terminal_id in all_terminals:
             try:
                 terminal = all_terminals.get(terminal_id)
                 if terminal is None:
