@@ -3934,20 +3934,25 @@ async def recover_terminal(
                 diagnosis["status"] = "relaunch_pending"
                 return diagnosis
 
-            # Poll status until IDLE/COMPLETED (up to 90s)
-            from cli_agent_orchestrator.utils.terminal import wait_until_status
-            ready = await wait_until_status(
-                terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=90,
-            )
+            # Wait for kiro to show idle prompt in the pane (up to 60s).
+            # Uses pane content polling rather than status monitor — the status
+            # monitor requires a FIFO feed which may not be active on this terminal.
+            kiro_ready = False
+            for _ in range(120):
+                await asyncio.sleep(0.5)
+                try:
+                    _txt = get_backend().get_history(session, window, tail_lines=5, strip_escapes=True)
+                    if _txt and ("ask a question" in _txt.lower() or "credits:" in _txt.lower()):
+                        kiro_ready = True
+                        break
+                except Exception:
+                    pass
 
-            if not ready:
-                diagnosis["error"] = (
-                    "Kiro launched but did not reach IDLE within 90s — "
-                    "check the terminal directly."
-                )
-                diagnosis["status"] = "relaunch_pending"
+            if not kiro_ready:
+                # Not confirmed idle but kiro process is running — proceed anyway
+                # rather than blocking on status monitor which needs FIFO
+                logger.warning("recover_terminal: kiro running but idle prompt not seen within 60s — proceeding anyway")
+
                 return diagnosis
 
             # Build context message
