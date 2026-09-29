@@ -3848,44 +3848,12 @@ async def recover_terminal(
             await asyncio.sleep(0.3)
             status_monitor.reset_buffer(terminal_id)
 
-            # Start the FIFO reader thread FIRST — pipe-pane blocks until
-            # a reader is open on the named pipe. Reader must exist before
-            # pipe_pane() is called or pipe-pane silently drops inactive.
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+            # No pipe-pane setup — it blocks the pane on machines where the
+            # FIFO reader never delivers (named pipe buffer fills, pane freezes).
+            # Status detection uses pane_current_command + pane content polling.
+            get_backend().send_special_key(session, window, "Enter")
+            await asyncio.sleep(1.0)
 
-            def _probe(s=session, w=window) -> str:
-                try:
-                    return get_backend().get_history(s, w, tail_lines=50)
-                except Exception:
-                    return ""
-
-            def _rearm(s=session, w=window, p=str(fifo_path)) -> None:
-                get_backend().stop_pipe_pane(s, w)
-                get_backend().pipe_pane(s, w, p)
-
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe, rearm=_rearm)
-            await asyncio.sleep(0.5)  # give reader thread time to open the FIFO end
-
-            # Now attach pipe-pane — reader is ready so it won't block
-            get_backend().pipe_pane(session, window, str(fifo_path))
-
-            # Verify pipe-pane actually attached
-            try:
-                import subprocess as _sp2
-                _pipe_status = _sp2.run(
-                    _tmux_base + ["display-message", "-p", "-t", f"{session}:{window}", "#{pane_pipe}"],
-                    capture_output=True, text=True, check=False
-                ).stdout.strip()
-                diagnosis["checks"]["pane_pipe_active"] = _pipe_status == "1"
-            except Exception:
-                pass
-
-            # Send multiple Enter presses to ensure the shell prompt
-            # flows through the pipe — some machines need more nudging.
-            for _ in range(3):
-                get_backend().send_special_key(session, window, "Enter")
-                await asyncio.sleep(0.3)
-            await asyncio.sleep(0.5)
 
             # Build the kiro command
             resolved_engine = resolve_kiro_engine(persisted=None)
