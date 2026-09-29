@@ -3925,6 +3925,14 @@ async def recover_terminal(
             # Send command and poll until kiro replaces the shell (up to 30s)
             status_monitor.notify_input_sent(terminal_id, assume_processing=True)
             get_backend().send_keys(session, window, command)
+            await asyncio.sleep(1.0)
+
+            # Snapshot pane right after send to confirm command landed
+            try:
+                _snap = get_backend().get_history(session, window, tail_lines=3, strip_escapes=True)
+                diagnosis["checks"]["pane_after_send"] = _snap.strip()[-200:] if _snap else "empty"
+            except Exception:
+                pass
 
             kiro_started = False
             for _ in range(60):
