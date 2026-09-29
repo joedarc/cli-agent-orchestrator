@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
 import { api, TerminalMeta } from '../api'
-import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
+import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp, HeartPulse } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -85,6 +85,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const [sendInputOpen, setSendInputOpen] = useState<Record<string, boolean>>({})
   const [sendInputValues, setSendInputValues] = useState<Record<string, string>>({})
   const [sendingInput, setSendingInput] = useState<string | null>(null)
+  const [recoveringTerminal, setRecoveringTerminal] = useState<string | null>(null)
+  const [recoveryResult, setRecoveryResult] = useState<{ terminal_id: string; status: string; checks: Record<string, unknown>; recovered: boolean; error: string | null } | null>(null)
   const [agentTypeFilter, setAgentTypeFilter] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<string | null>(null)
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc')
@@ -205,6 +207,27 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     }
     setExitingTerminal(null)
     setPendingExit(null)
+  }
+
+  const handleRecoverTerminal = async (terminalId: string) => {
+    setRecoveringTerminal(terminalId)
+    try {
+      const result = await api.recoverTerminal(terminalId)
+      setRecoveryResult(result)
+      if (result.recovered) {
+        showSnackbar({ type: 'success', message: 'Agent recovered and context restored' })
+      }
+    } catch (e: any) {
+      // Always show modal even on network/server error
+      setRecoveryResult({
+        terminal_id: terminalId,
+        status: 'error',
+        checks: {},
+        recovered: false,
+        error: e.message || 'Recovery request failed',
+      })
+    }
+    setRecoveringTerminal(null)
   }
 
   const handleDeleteSession = async () => {
@@ -445,6 +468,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
                                     <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
+                                    <button onClick={() => handleRecoverTerminal(t.id)} disabled={recoveringTerminal === t.id} className="p-1 text-gray-500 hover:text-teal-400 disabled:opacity-40 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title={recoveringTerminal === t.id ? 'Checking...' : 'Diagnose & recover agent'}><HeartPulse size={12} /></button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
                                     <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Graceful Exit"><LogOut size={12} /></button>
@@ -476,6 +500,39 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Recovery Result Modal */}
+      {recoveryResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setRecoveryResult(null)} />
+          <div className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-md mx-4">
+            <div className="flex items-center justify-between p-5 border-b border-gray-700/50">
+              <div className="flex items-center gap-2">
+                <HeartPulse size={16} className={recoveryResult.recovered ? 'text-teal-400' : recoveryResult.status === 'healthy' ? 'text-emerald-400' : 'text-red-400'} />
+                <h3 className="text-base font-semibold text-gray-200">
+                  {recoveryResult.status === 'healthy' ? 'Agent is Healthy' : recoveryResult.recovered ? 'Agent Recovered' : recoveryResult.status === 'dead' ? 'Dead Agent Detected' : 'Diagnosis Result'}
+                </h3>
+              </div>
+              <button onClick={() => setRecoveryResult(null)} className="p-1.5 text-gray-500 hover:text-gray-300 rounded-lg"><span className="text-lg leading-none">×</span></button>
+            </div>
+            <div className="p-5 space-y-3">
+              <div className="space-y-1.5">
+                {Object.entries(recoveryResult.checks).map(([key, val]) => (
+                  <div key={key} className="flex items-center justify-between text-xs">
+                    <span className="text-gray-500 font-mono">{key}</span>
+                    <span className={`font-mono ${val === true ? 'text-emerald-400' : val === false ? 'text-red-400' : 'text-gray-300'}`}>{String(val)}</span>
+                  </div>
+                ))}
+              </div>
+              {recoveryResult.error && <p className="text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded-lg p-3">{recoveryResult.error}</p>}
+              {recoveryResult.recovered && <p className="text-xs text-teal-300 bg-teal-900/20 border border-teal-800/30 rounded-lg p-3">Agent relaunched with scrollback context. Pending inbox messages have been reset for redelivery.</p>}
+            </div>
+            <div className="flex justify-end p-4 border-t border-gray-700/50">
+              <button onClick={() => setRecoveryResult(null)} className="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors">Close</button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { api, AgentProfileInfo, ProviderInfo } from '../api'
-import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
+import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X, HeartPulse } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -64,6 +64,8 @@ export function AgentPanel() {
   const { showSnackbar } = useStore()
   const [outputTerminalId, setOutputTerminalId] = useState<string | null>(null)
   const [showSpawnModal, setShowSpawnModal] = useState(false)
+  const [recoveringTerminal, setRecoveringTerminal] = useState<string | null>(null)
+  const [recoveryResult, setRecoveryResult] = useState<{ terminal_id: string; status: string; checks: Record<string, unknown>; recovered: boolean; error: string | null } | null>(null)
 
   const handleDeleteTerminal = async () => {
     if (!pendingClose) return
@@ -142,6 +144,21 @@ export function AgentPanel() {
     const interval = setInterval(fetchStatuses, 3000)
     return () => clearInterval(interval)
   }, [activeSessionDetail?.terminals.map(t => t.id).join(',')])
+
+  const handleRecoverTerminal = async (terminalId: string) => {
+    setRecoveringTerminal(terminalId)
+    try {
+      const result = await api.recoverTerminal(terminalId)
+      setRecoveryResult(result)
+      if (result.recovered) {
+        showSnackbar({ type: 'success', message: 'Agent recovered and context restored' })
+        if (activeSession) await selectSession(activeSession)
+      }
+    } catch (e: any) {
+      showSnackbar({ type: 'error', message: e.message || 'Recovery failed' })
+    }
+    setRecoveringTerminal(null)
+  }
 
   const handleCreate = async () => {
     if (creatingRef.current || !profile.trim()) return
@@ -376,6 +393,14 @@ export function AgentPanel() {
                       Inbox
                     </button>
                     <button
+                      onClick={() => handleRecoverTerminal(t.id)}
+                      disabled={recoveringTerminal === t.id}
+                      className="p-1.5 text-gray-400 hover:text-teal-400 disabled:opacity-40 transition-colors rounded"
+                      title={recoveringTerminal === t.id ? 'Checking...' : 'Diagnose & recover agent'}
+                    >
+                      <HeartPulse size={14} />
+                    </button>
+                    <button
                       onClick={() => openTerminal(t.id, t.provider, t.agent_profile)}
                       className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors"
                       title="Open live terminal"
@@ -474,6 +499,57 @@ export function AgentPanel() {
           terminalId={outputTerminalId}
           onClose={() => setOutputTerminalId(null)}
         />
+      )}
+
+      {/* Recovery Result Modal */}
+      {recoveryResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setRecoveryResult(null)} />
+          <div className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-md mx-4">
+            <div className="flex items-center justify-between p-5 border-b border-gray-700/50">
+              <div className="flex items-center gap-2">
+                <HeartPulse size={16} className={recoveryResult.recovered ? 'text-teal-400' : recoveryResult.status === 'healthy' ? 'text-emerald-400' : 'text-red-400'} />
+                <h3 className="text-base font-semibold text-gray-200">
+                  {recoveryResult.status === 'healthy' ? 'Agent is Healthy' :
+                   recoveryResult.recovered ? 'Agent Recovered' :
+                   recoveryResult.status === 'dead' ? 'Dead Agent Detected' :
+                   'Diagnosis Result'}
+                </h3>
+              </div>
+              <button onClick={() => setRecoveryResult(null)} className="p-1.5 text-gray-500 hover:text-gray-300 rounded-lg">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="p-5 space-y-3">
+              <div className="space-y-1.5">
+                {Object.entries(recoveryResult.checks).map(([key, val]) => (
+                  <div key={key} className="flex items-center justify-between text-xs">
+                    <span className="text-gray-500 font-mono">{key}</span>
+                    <span className={`font-mono ${val === true ? 'text-emerald-400' : val === false ? 'text-red-400' : 'text-gray-300'}`}>
+                      {String(val)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {recoveryResult.error && (
+                <p className="text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded-lg p-3">{recoveryResult.error}</p>
+              )}
+              {recoveryResult.recovered && (
+                <p className="text-xs text-teal-300 bg-teal-900/20 border border-teal-800/30 rounded-lg p-3">
+                  Agent relaunched with scrollback context. Pending inbox messages have been reset for redelivery.
+                </p>
+              )}
+            </div>
+            <div className="flex justify-end p-4 border-t border-gray-700/50">
+              <button
+                onClick={() => setRecoveryResult(null)}
+                className="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Close Confirmation Modal */}

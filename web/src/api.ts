@@ -569,6 +569,8 @@ export const api = {
   },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
+    recoverTerminal: (id: string) =>
+    fetchJSON<{ terminal_id: string; status: string; checks: Record<string, unknown>; recovered: boolean; error: string | null }>(`/terminals/${id}/recover`, { method: 'POST', timeoutMs: 120000 }),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
 
