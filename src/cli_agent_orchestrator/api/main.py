@@ -3937,6 +3937,10 @@ async def recover_terminal(
             except Exception:
                 pass
 
+            # Poll until kiro replaces the shell (up to 30s).
+            # Also check pane content for kiro idle prompt as fallback —
+            # on some machines the process name stays "zsh" briefly while
+            # the kiro TUI is already rendering.
             kiro_started = False
             for _ in range(60):
                 await asyncio.sleep(0.5)
@@ -3945,6 +3949,12 @@ async def recover_terminal(
                     if cmd and cmd not in _SHELLS:
                         kiro_started = True
                         diagnosis["checks"]["kiro_process"] = cmd
+                        break
+                    # Fallback: kiro idle prompt visible in pane
+                    _pane_txt = get_backend().get_history(session, window, tail_lines=5, strip_escapes=True)
+                    if _pane_txt and ("ask a question" in _pane_txt.lower() or "credits:" in _pane_txt.lower()):
+                        kiro_started = True
+                        diagnosis["checks"]["kiro_process"] = "kiro-cli (detected via pane content)"
                         break
                 except Exception:
                     pass
