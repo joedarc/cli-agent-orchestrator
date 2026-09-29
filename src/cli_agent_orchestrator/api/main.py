@@ -3893,6 +3893,53 @@ async def recover_terminal(
                 model=model,
             )
 
+            # Check for TTY mismatch — pane TTY vs shell TTY.
+            # Older kiro versions allocate a new PTY for the TUI; when kiro
+            # dies the shell is left on the new PTY while the pane still uses
+            # the original one. Input goes to the pane TTY but the shell reads
+            # from a different TTY — pane appears frozen. Fix: respawn-pane
+            # to get a fresh shell on the correct pane TTY.
+            try:
+                pane_tty = _sp.run(
+                    _tmux_base + ["display-message", "-p", "-t", f"{session}:{window}", "#{pane_tty}"],
+                    capture_output=True, text=True, check=False
+                ).stdout.strip()
+                shell_pid_result = _sp.run(
+                    ["ps", "-A", "-o", "pid,ppid,tty"],
+                    capture_output=True, text=True, check=False
+                ).stdout
+                # Find direct child of pane PID
+                pane_pid_str = str(_sp.run(
+                    _tmux_base + ["display-message", "-p", "-t", f"{session}:{window}", "#{pane_pid}"],
+                    capture_output=True, text=True, check=False
+                ).stdout.strip())
+                shell_tty = None
+                for line in shell_pid_result.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1] == pane_pid_str:
+                        shell_tty = "/dev/" + parts[2] if not parts[2].startswith("/") else parts[2]
+                        break
+                if pane_tty and shell_tty and pane_tty != shell_tty:
+                    logger.warning(
+                        "recover_terminal: TTY mismatch for %s — pane=%s shell=%s, "
+                        "running respawn-pane to fix",
+                        terminal_id, pane_tty, shell_tty
+                    )
+                    diagnosis["checks"]["tty_mismatch"] = f"pane={pane_tty} shell={shell_tty}"
+                    _sp.run(
+                        _tmux_base + ["respawn-pane", "-k", "-t", f"{session}:{window}"],
+                        check=False, capture_output=True
+                    )
+                    await asyncio.sleep(2.0)
+                    # Re-send C-c and Enter on fresh shell
+                    get_backend().send_special_key(session, window, "C-c")
+                    await asyncio.sleep(0.5)
+                    get_backend().send_special_key(session, window, "Enter")
+                    await asyncio.sleep(1.0)
+                    status_monitor.reset_buffer(terminal_id)
+            except Exception as _tty_e:
+                logger.debug("recover_terminal: TTY check failed: %s", _tty_e)
+
             # Send command and poll until kiro replaces the shell (up to 30s)
             status_monitor.notify_input_sent(terminal_id, assume_processing=True)
             get_backend().send_keys(session, window, command)
