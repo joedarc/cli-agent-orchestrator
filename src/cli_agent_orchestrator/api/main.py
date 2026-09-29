@@ -3824,9 +3824,12 @@ async def recover_terminal(
                     resume_id = _m.group(1)
                     diagnosis["checks"]["resume_id"] = resume_id
 
-            # Cancel copy mode and interrupt anything stuck
+            # Cancel copy mode and interrupt anything stuck.
+            # Must use the backend's socket-aware tmux command — bare "tmux"
+            # hits the default socket and misses isolated sockets (cao-start mobile).
+            _tmux_base = getattr(getattr(get_backend(), "_client", None), "_tmux_cmd", ["tmux"])
             _sp.run(
-                ["tmux", "send-keys", "-t", f"{session}:{window}", "-X", "cancel"],
+                _tmux_base + ["send-keys", "-t", f"{session}:{window}", "-X", "cancel"],
                 check=False, capture_output=True,
             )
             get_backend().send_special_key(session, window, "C-c")
@@ -3870,7 +3873,7 @@ async def recover_terminal(
             try:
                 import subprocess as _sp2
                 _pipe_status = _sp2.run(
-                    ["tmux", "display-message", "-p", "-t", f"{session}:{window}", "#{pane_pipe}"],
+                    _tmux_base + ["display-message", "-p", "-t", f"{session}:{window}", "#{pane_pipe}"],
                     capture_output=True, text=True, check=False
                 ).stdout.strip()
                 diagnosis["checks"]["pane_pipe_active"] = _pipe_status == "1"
