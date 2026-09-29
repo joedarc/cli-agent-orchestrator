@@ -4019,21 +4019,26 @@ async def recover_terminal(
             # pane_current_command or pane content). Proceed directly.
             kiro_ready = True
 
-            # Build context message
+            # Build context message.
+            # When --resume-id is used kiro restores its own conversation history,
+            # so only send inbox messages (worker results). The full scrollback
+            # would blend other agents' output into the restored conversation.
+            # When no resume-id, send both scrollback and inbox as context.
             parts = []
-            if scrollback.strip():
+            if not resume_id and scrollback.strip():
                 parts.append(
                     "--- RECOVERY CONTEXT: session scrollback ---\n" + scrollback.strip()
                 )
             if inbox_context.strip():
                 parts.append(
-                    "--- RECOVERY CONTEXT: inbox messages ---\n" + inbox_context.strip()
+                    "--- RECOVERY CONTEXT: inbox messages from workers ---\n" + inbox_context.strip()
                 )
-            parts.append(
-                "--- END RECOVERY CONTEXT ---\n"
-                "Your previous session was interrupted. Review the context above "
-                "and continue from where you left off."
-            )
+            if parts:
+                parts.append(
+                    "--- END RECOVERY CONTEXT ---\n"
+                    "Your previous session was interrupted. Review the context above "
+                    "and continue from where you left off."
+                )
             context_msg = "\n\n".join(parts)
 
             await asyncio.to_thread(terminal_service.send_input, terminal_id, context_msg)
