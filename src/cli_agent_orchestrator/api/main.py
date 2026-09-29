@@ -3861,14 +3861,17 @@ async def recover_terminal(
                 get_backend().pipe_pane(s, w, p)
 
             fifo_manager.create_reader(terminal_id, pane_probe=_probe, rearm=_rearm)
-            await asyncio.sleep(0.2)  # give reader thread time to open the FIFO end
+            await asyncio.sleep(0.5)  # give reader thread time to open the FIFO end
 
             # Now attach pipe-pane — reader is ready so it won't block
             get_backend().pipe_pane(session, window, str(fifo_path))
 
-            # Nudge shell to emit prompt through the pipe
-            get_backend().send_special_key(session, window, "Enter")
-            await asyncio.sleep(1.0)
+            # Send multiple Enter presses to ensure the shell prompt
+            # flows through the pipe — some machines need more nudging.
+            for _ in range(3):
+                get_backend().send_special_key(session, window, "Enter")
+                await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
             # Build the kiro command
             resolved_engine = resolve_kiro_engine(persisted=None)
