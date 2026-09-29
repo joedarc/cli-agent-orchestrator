@@ -3866,6 +3866,17 @@ async def recover_terminal(
             # Now attach pipe-pane — reader is ready so it won't block
             get_backend().pipe_pane(session, window, str(fifo_path))
 
+            # Verify pipe-pane actually attached
+            try:
+                import subprocess as _sp2
+                _pipe_status = _sp2.run(
+                    ["tmux", "display-message", "-p", "-t", f"{session}:{window}", "#{pane_pipe}"],
+                    capture_output=True, text=True, check=False
+                ).stdout.strip()
+                diagnosis["checks"]["pane_pipe_active"] = _pipe_status == "1"
+            except Exception:
+                pass
+
             # Send multiple Enter presses to ensure the shell prompt
             # flows through the pipe — some machines need more nudging.
             for _ in range(3):
