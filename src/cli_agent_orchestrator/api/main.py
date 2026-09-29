@@ -3993,6 +3993,12 @@ async def recover_terminal(
         except Exception as e:
             logger.exception("recover_terminal: relaunch failed for %s", terminal_id)
             diagnosis["error"] = "Relaunch failed: " + str(e)
+            # Clean up provider registration on failure so it doesn't
+            # accumulate across multiple Health button clicks
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
 
         return diagnosis
 
