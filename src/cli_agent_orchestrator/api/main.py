@@ -3928,11 +3928,45 @@ async def recover_terminal(
                     pass
 
             if not kiro_started:
-                diagnosis["error"] = (
-                    "kiro-cli did not start within 30s — check the terminal directly."
+                # Kiro command sent but not detected — pane may have a TTY mismatch
+                # (shell on wrong PTY after kiro exit). Try exec zsh to reattach
+                # the shell to the correct TTY, then retry the kiro launch once.
+                logger.warning(
+                    "recover_terminal: kiro not detected after 30s for %s — "
+                    "attempting exec zsh TTY fix then retrying",
+                    terminal_id,
                 )
-                diagnosis["status"] = "relaunch_pending"
-                return diagnosis
+                diagnosis["checks"]["tty_fix_attempted"] = True
+                get_backend().send_keys(session, window, "exec zsh")
+                await asyncio.sleep(2.0)
+                # Retry kiro launch
+                status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+                get_backend().send_keys(session, window, command)
+                await asyncio.sleep(1.0)
+                # Poll again for kiro (up to 30s)
+                for _ in range(60):
+                    await asyncio.sleep(0.5)
+                    try:
+                        cmd = get_backend().get_pane_current_command(session, window)
+                        if cmd and cmd not in _SHELLS:
+                            kiro_started = True
+                            diagnosis["checks"]["kiro_process"] = cmd + " (after tty fix)"
+                            break
+                        _pane_txt = get_backend().get_history(session, window, tail_lines=5, strip_escapes=True)
+                        if _pane_txt and ("ask a question" in _pane_txt.lower() or "credits:" in _pane_txt.lower()):
+                            kiro_started = True
+                            diagnosis["checks"]["kiro_process"] = "kiro-cli (detected via pane after tty fix)"
+                            break
+                    except Exception:
+                        pass
+
+                if not kiro_started:
+                    diagnosis["error"] = (
+                        "kiro-cli did not start within 30s even after TTY fix. "
+                        "Run: tmux kill-window -t " + session + ":" + window + " then use Health to relaunch."
+                    )
+                    diagnosis["status"] = "relaunch_pending"
+                    return diagnosis
 
             # kiro_started already confirmed kiro is running (either via
             # pane_current_command or pane content). Proceed directly.
