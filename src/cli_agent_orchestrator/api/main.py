@@ -3934,26 +3934,9 @@ async def recover_terminal(
                 diagnosis["status"] = "relaunch_pending"
                 return diagnosis
 
-            # Wait for kiro to show idle prompt in the pane (up to 60s).
-            # Uses pane content polling rather than status monitor — the status
-            # monitor requires a FIFO feed which may not be active on this terminal.
-            kiro_ready = False
-            for _ in range(120):
-                await asyncio.sleep(0.5)
-                try:
-                    _txt = get_backend().get_history(session, window, tail_lines=5, strip_escapes=True)
-                    if _txt and ("ask a question" in _txt.lower() or "credits:" in _txt.lower()):
-                        kiro_ready = True
-                        break
-                except Exception:
-                    pass
-
-            if not kiro_ready:
-                # Not confirmed idle but kiro process is running — proceed anyway
-                # rather than blocking on status monitor which needs FIFO
-                logger.warning("recover_terminal: kiro running but idle prompt not seen within 60s — proceeding anyway")
-
-                return diagnosis
+            # kiro_started already confirmed kiro is running (either via
+            # pane_current_command or pane content). Proceed directly.
+            kiro_ready = True
 
             # Build context message
             parts = []
