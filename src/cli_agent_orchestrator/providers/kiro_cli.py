@@ -25,6 +25,7 @@ import time
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -196,6 +197,7 @@ class KiroCliProvider(BaseProvider):
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
+        self._process_dead = False  # latched True once dead-process guard fires
         self._input_received = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
@@ -493,6 +495,46 @@ class KiroCliProvider(BaseProvider):
         output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
+
+        # Check -1: Dead-process guard.
+        # If the pane's foreground command is a bare shell (zsh, bash, etc.)
+        # AND the provider has already been initialized (Kiro has launched),
+        # the Kiro process has exited. Pattern matching against a stale frozen
+        # screen would return IDLE or COMPLETED from the last TUI frame, causing
+        # InboxService to paste pending messages into the shell where they are
+        # silently dropped. Return ERROR so the supervisor sees an actionable
+        # status rather than a ghost IDLE/COMPLETED.
+        #
+        # Gated on self._initialized for the same reason as Check 3's original
+        # shell_baseline check: between send_keys('kiro-cli chat ...') and the
+        # moment kiro-cli exec's, the pane's current command is still the shell.
+        # Firing without this gate would return ERROR for every terminal during
+        # the brief launch window before Kiro replaces the shell process.
+        if self._process_dead:
+            # Already confirmed dead — skip the subprocess fork on every call.
+            return TerminalStatus.ERROR
+        if self._initialized:
+            try:
+                current_cmd = get_backend().get_pane_current_command(
+                    self.session_name, self.window_name
+                )
+                if current_cmd is not None and current_cmd in BRACKETED_PASTE_INCOMPATIBLE_SHELLS:
+                    self._process_dead = True
+                    logger.warning(
+                        "get_status [%s]: pane foreground is '%s' — Kiro process has exited, "
+                        "returning ERROR to prevent inbox delivery into dead pane",
+                        self.session_name,
+                        current_cmd,
+                    )
+                    return TerminalStatus.ERROR
+            except Exception as _dead_proc_exc:
+                # get_pane_current_command is best-effort; a lookup failure must not
+                # block status detection — fall through to the normal pattern path.
+                logger.debug(
+                    "get_status [%s]: dead-process check failed: %s",
+                    self.session_name,
+                    _dead_proc_exc,
+                )
 
         # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
         # cursor-movement sequences are intentionally preserved: the permission

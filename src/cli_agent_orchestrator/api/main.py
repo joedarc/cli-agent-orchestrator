@@ -1251,15 +1251,42 @@ def _reconcile_terminals_at_startup() -> None:
                 provider = provider_manager.get_provider(terminal_id)
                 if provider is None:
                     # Provider wasn't re-registered (server restarted without the
-                    # terminal being recreated). Seed IDLE directly — the pane is
-                    # alive and the agent was idle when we last saw it.
-                    status_monitor._apply_detection(  # type: ignore[attr-defined]
-                        terminal_id, TerminalStatus.IDLE
-                    )
-                    logger.info(
-                        "Inbox recovery: seeded terminal %s as IDLE (no provider)",
-                        terminal_id,
-                    )
+                    # terminal being recreated). Before seeding IDLE, check whether
+                    # the Kiro process is actually still running. If the foreground
+                    # command has reverted to a shell, the process has exited and
+                    # seeding IDLE would cause InboxService to paste into a dead pane
+                    # (message silently dropped into the shell). Seed ERROR instead
+                    # so the supervisor sees an actionable status and the inbox is
+                    # NOT flushed into the dead pane.
+                    try:
+                        from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+                        pane_cmd = get_backend().get_pane_current_command(session, window)
+                        process_dead = (
+                            pane_cmd is not None
+                            and pane_cmd in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+                        )
+                    except Exception:
+                        process_dead = False  # fail open — seed IDLE on lookup failure
+
+                    if process_dead:
+                        status_monitor._apply_detection(  # type: ignore[attr-defined]
+                            terminal_id, TerminalStatus.ERROR
+                        )
+                        logger.warning(
+                            "Inbox recovery: terminal %s pane foreground is '%s' — "
+                            "Kiro process has exited; seeded as ERROR to prevent "
+                            "inbox delivery into dead pane",
+                            terminal_id,
+                            pane_cmd,
+                        )
+                    else:
+                        status_monitor._apply_detection(  # type: ignore[attr-defined]
+                            terminal_id, TerminalStatus.IDLE
+                        )
+                        logger.info(
+                            "Inbox recovery: seeded terminal %s as IDLE (no provider)",
+                            terminal_id,
+                        )
                 else:
                     detected = provider.get_status(pane_output)
                     if detected in (
@@ -3663,6 +3690,309 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
         )
+
+
+@app.post("/terminals/{terminal_id}/recover")
+async def recover_terminal(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Diagnose a terminal and attempt to recover a dead Kiro provider process.
+
+    Checks pane liveness, detects dead Kiro process (foreground reverted to shell),
+    collects scrollback + inbox history, relaunches kiro-cli, feeds context, and
+    resets delivered inbox messages to PENDING for retry.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        get_inbox_messages,
+        get_pending_messages,
+        get_terminal_metadata,
+        update_message_status,
+    )
+    from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+    from cli_agent_orchestrator.models.inbox import MessageStatus
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+    diagnosis: Dict = {
+        "terminal_id": terminal_id,
+        "status": "unknown",
+        "checks": {},
+        "recovered": False,
+        "error": None,
+    }
+
+    try:
+        terminal = get_terminal_metadata(terminal_id)
+        if terminal is None:
+            diagnosis["status"] = "not_found"
+            diagnosis["error"] = f"Terminal {terminal_id} not found"
+            return diagnosis
+
+        session = terminal.get("tmux_session")
+        window = terminal.get("tmux_window")
+        agent_profile = terminal.get("agent_profile")
+        provider_name = terminal.get("provider")
+
+        diagnosis["checks"]["session"] = session
+        diagnosis["checks"]["window"] = window
+        diagnosis["checks"]["agent_profile"] = agent_profile
+        diagnosis["checks"]["provider"] = provider_name
+
+        if not session or not window:
+            diagnosis["status"] = "incomplete"
+            diagnosis["error"] = "Terminal record missing session or window"
+            return diagnosis
+
+        # Check pane reachability and foreground command
+        try:
+            pane_cmd = get_backend().get_pane_current_command(session, window)
+            diagnosis["checks"]["pane_reachable"] = True
+            diagnosis["checks"]["pane_current_command"] = pane_cmd
+        except Exception as e:
+            diagnosis["checks"]["pane_reachable"] = False
+            diagnosis["status"] = "unreachable"
+            diagnosis["error"] = f"Pane not reachable: {e}"
+            return diagnosis
+
+        process_dead = pane_cmd is not None and pane_cmd in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+        diagnosis["checks"]["process_dead"] = process_dead
+        diagnosis["checks"]["cao_status"] = status_monitor.get_status(terminal_id).value
+
+        pending = get_pending_messages(terminal_id, limit=10)
+        diagnosis["checks"]["pending_inbox_messages"] = len(pending)
+
+        if not process_dead:
+            diagnosis["status"] = "healthy"
+            return diagnosis
+
+        diagnosis["status"] = "dead"
+
+        if provider_name != "kiro_cli" or not agent_profile:
+            diagnosis["error"] = (
+                "Cannot auto-recover: provider=" + repr(provider_name) +
+                ", agent_profile=" + repr(agent_profile) + ". Manual restart required."
+            )
+            return diagnosis
+
+        # Grab scrollback for context
+        try:
+            scrollback = get_backend().get_history(session, window, tail_lines=150, strip_escapes=True)
+        except Exception:
+            scrollback = ""
+
+        # Collect recent inbox messages for context
+        try:
+            recent_msgs = get_inbox_messages(terminal_id, limit=5)
+            inbox_lines = []
+            for m in recent_msgs:
+                inbox_lines.append("[Inbox from " + m.sender_id + "]:\n" + m.message)
+            inbox_context = "\n\n".join(inbox_lines)
+        except Exception:
+            inbox_context = ""
+
+        # Relaunch kiro using the full create_terminal() flow on the existing
+        # tmux window. Key insight: we must start the FIFO reader thread BEFORE
+        # setting up pipe-pane — a named pipe blocks writers until a reader is
+        # open, so pipe_pane started without a reader silently drops to inactive.
+        # Also: if kiro left a --resume-id in the scrollback, use it to restore
+        # the full conversation context.
+        try:
+            import asyncio
+            import re as _re
+            import shlex
+            import subprocess as _sp
+            from cli_agent_orchestrator.constants import (
+                BRACKETED_PASTE_INCOMPATIBLE_SHELLS as _SHELLS,
+                FIFO_DIR,
+            )
+            from cli_agent_orchestrator.models.kiro_engine import resolve_kiro_engine
+            from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+            from cli_agent_orchestrator.providers.manager import provider_manager
+            from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+            from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+            from cli_agent_orchestrator.utils.tool_mapping import get_kiro_trust_tools
+
+            allowed_tools = terminal.get("allowed_tools")
+            model = terminal.get("model")
+
+            # Extract kiro resume-id from scrollback if available.
+            # Kiro prints "Resume with: kiro-cli --resume-id <uuid>" on exit.
+            resume_id = None
+            if scrollback:
+                _m = _re.search(r"--resume-id\s+([0-9a-f-]{36})", scrollback)
+                if _m:
+                    resume_id = _m.group(1)
+                    diagnosis["checks"]["resume_id"] = resume_id
+
+            # Cancel copy mode and interrupt anything stuck
+            _sp.run(
+                ["tmux", "send-keys", "-t", f"{session}:{window}", "-X", "cancel"],
+                check=False, capture_output=True,
+            )
+            get_backend().send_special_key(session, window, "C-c")
+            await asyncio.sleep(0.5)
+
+            # Tear down stale provider and FIFO state
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
+            fifo_manager.stop_reader(terminal_id)
+            try:
+                get_backend().stop_pipe_pane(session, window)
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+            status_monitor.reset_buffer(terminal_id)
+
+            # Start the FIFO reader thread FIRST — pipe-pane blocks until
+            # a reader is open on the named pipe. Reader must exist before
+            # pipe_pane() is called or pipe-pane silently drops inactive.
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            def _probe(s=session, w=window) -> str:
+                try:
+                    return get_backend().get_history(s, w, tail_lines=50)
+                except Exception:
+                    return ""
+
+            def _rearm(s=session, w=window, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe, rearm=_rearm)
+            await asyncio.sleep(0.2)  # give reader thread time to open the FIFO end
+
+            # Now attach pipe-pane — reader is ready so it won't block
+            get_backend().pipe_pane(session, window, str(fifo_path))
+
+            # Nudge shell to emit prompt through the pipe
+            get_backend().send_special_key(session, window, "Enter")
+            await asyncio.sleep(1.0)
+
+            # Build the kiro command
+            resolved_engine = resolve_kiro_engine(persisted=None)
+            yolo = bool(allowed_tools and "*" in allowed_tools)
+
+            if not model:
+                try:
+                    profile_obj = load_agent_profile(agent_profile)
+                    model = profile_obj.model if profile_obj else None
+                except Exception:
+                    model = None
+
+            base_args = build_kiro_command(
+                resolved_engine, agent_profile, model=model, yolo=yolo
+            )
+            if not yolo and allowed_tools:
+                trust_tags = get_kiro_trust_tools(allowed_tools)
+                if trust_tags is not None:
+                    base_args.extend(["--trust-tools", trust_tags])
+
+            # Append --resume-id if we found one — restores full conversation
+            if resume_id:
+                base_args.extend(["--resume-id", resume_id])
+
+            command = shlex.join(base_args)
+            diagnosis["checks"]["relaunch_attempted"] = True
+            diagnosis["checks"]["command"] = command
+
+            # Register provider so status detection works during init
+            provider_instance = provider_manager.create_provider(
+                "kiro_cli",
+                terminal_id,
+                session,
+                window,
+                agent_profile,
+                allowed_tools,
+                model=model,
+            )
+
+            # Send command and poll until kiro replaces the shell (up to 30s)
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            get_backend().send_keys(session, window, command)
+
+            kiro_started = False
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                try:
+                    cmd = get_backend().get_pane_current_command(session, window)
+                    if cmd and cmd not in _SHELLS:
+                        kiro_started = True
+                        diagnosis["checks"]["kiro_process"] = cmd
+                        break
+                except Exception:
+                    pass
+
+            if not kiro_started:
+                diagnosis["error"] = (
+                    "kiro-cli did not start within 30s — check the terminal directly."
+                )
+                diagnosis["status"] = "relaunch_pending"
+                return diagnosis
+
+            # Poll status until IDLE/COMPLETED (up to 90s)
+            from cli_agent_orchestrator.utils.terminal import wait_until_status
+            ready = await wait_until_status(
+                terminal_id,
+                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                timeout=90,
+            )
+
+            if not ready:
+                diagnosis["error"] = (
+                    "Kiro launched but did not reach IDLE within 90s — "
+                    "check the terminal directly."
+                )
+                diagnosis["status"] = "relaunch_pending"
+                return diagnosis
+
+            # Build context message
+            parts = []
+            if scrollback.strip():
+                parts.append(
+                    "--- RECOVERY CONTEXT: session scrollback ---\n" + scrollback.strip()
+                )
+            if inbox_context.strip():
+                parts.append(
+                    "--- RECOVERY CONTEXT: inbox messages ---\n" + inbox_context.strip()
+                )
+            parts.append(
+                "--- END RECOVERY CONTEXT ---\n"
+                "Your previous session was interrupted. Review the context above "
+                "and continue from where you left off."
+            )
+            context_msg = "\n\n".join(parts)
+
+            await asyncio.to_thread(terminal_service.send_input, terminal_id, context_msg)
+
+            # Reset delivered messages back to PENDING
+            try:
+                all_msgs = get_inbox_messages(terminal_id, limit=50)
+                reset_count = 0
+                for msg in all_msgs:
+                    if msg.status == MessageStatus.DELIVERED:
+                        update_message_status(msg.id, MessageStatus.PENDING)
+                        reset_count += 1
+                diagnosis["checks"]["inbox_messages_reset"] = reset_count
+            except Exception as e:
+                logger.warning("recover_terminal: failed to reset inbox messages: %s", e)
+
+            diagnosis["status"] = "recovered"
+            diagnosis["recovered"] = True
+            logger.info("recover_terminal: recovered terminal %s (session=%s)", terminal_id, session)
+
+        except Exception as e:
+            logger.exception("recover_terminal: relaunch failed for %s", terminal_id)
+            diagnosis["error"] = "Relaunch failed: " + str(e)
+
+        return diagnosis
+
+    except Exception as e:
+        logger.exception("recover_terminal: unexpected error for %s", terminal_id)
+        diagnosis["status"] = "error"
+        diagnosis["error"] = str(e)
+        return diagnosis
 
 
 @app.post("/terminals/{terminal_id}/input")

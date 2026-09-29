@@ -1793,13 +1793,15 @@ class TestKiroCliCheck3ShellBaseline:
     """Tests for Check 3: shell-baseline IDLE detection."""
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    def test_check3_shell_match_returns_idle(self, mock_tmux):
-        """No idle prompt + current command matches shell_baseline → IDLE.
+    def test_check3_shell_match_returns_error(self, mock_tmux):
+        """No idle prompt + current command is a shell → ERROR (dead process).
 
-        Requires `_initialized=True`: the shell-baseline IDLE rule is only
-        trustworthy after kiro-cli has launched. Pre-launch the pane's
-        current command is still the shell, so honoring it would let
-        pastes leak into Kiro's boot screen.
+        When the pane's foreground command reverts to a shell, the Kiro
+        process has exited. The dead-process guard (Check -1) fires before
+        any idle-prompt matching and returns ERROR so the supervisor sees an
+        actionable terminal state. Returning IDLE here would cause
+        InboxService to paste pending messages into the shell, silently
+        dropping them.
         """
         output = "Some processing output without idle prompt"
         mock_tmux.return_value.get_pane_current_command.return_value = "bash"
@@ -1809,7 +1811,7 @@ class TestKiroCliCheck3ShellBaseline:
         provider._initialized = True
         status = provider.get_status(output)
 
-        assert status == TerminalStatus.IDLE
+        assert status == TerminalStatus.ERROR
         mock_tmux.return_value.get_pane_current_command.assert_called_once_with(
             "test-session", "window-0"
         )
