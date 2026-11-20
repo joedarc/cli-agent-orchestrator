@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────
+  Merge gt/main into this branch and report any conflicts.
+
+  I'll merge gt/main into the current branch now.
+
+\x1b]7501;state=working:app=kiro-cli\x07 Kiro is working · esc to cancel
+ Shell git merge gt/main
+   I will run the following command: git merge gt/main
+
+ shell requires approval
+ ❯ Yes, single permission
+   Trust, always allow in this session
+   No (Tab to edit)
+\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07

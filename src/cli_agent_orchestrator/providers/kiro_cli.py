@@ -149,6 +149,36 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 # Bottom pane lines scanned for the consent dialog (mirrors codex's window).
 STARTUP_PROMPT_BOTTOM_LINES = 15
 
+# Kiro's OSC 7501 agent-state sequence, e.g.
+#   ESC ] 7501;state=blocked:kind=permission:app=kiro-cli BEL
+#   ESC ] 7501;state=done:app=kiro-cli BEL
+# Group 1 is the colon-separated state field. Accepts BEL or ST (ESC \) as the
+# terminator. Matched against the RAW buffer, before any escape stripping.
+KIRO_OSC_STATE_PATTERN = re.compile(r"\x1b\]7501;state=([^\x07\x1b]*)(?:\x07|\x1b\\)")
+
+# Bottom lines scanned for an active TUI permission menu (same window as the
+# trust-all-tools footer check in get_status).
+PERMISSION_BOTTOM_LINES = 20
+
+
+def _last_kiro_osc_state(output: str) -> Optional[str]:
+    """Return the state field of the last Kiro OSC 7501 sequence, or None."""
+    if "\x1b]7501;" not in output:
+        return None
+    last = None
+    for last in KIRO_OSC_STATE_PATTERN.finditer(output):
+        pass
+    return last.group(1) if last else None
+
+
+def _is_kiro_permission_block(state: Optional[str]) -> bool:
+    """True for a 7501 state like ``blocked:kind=permission:app=kiro-cli``."""
+    if not state:
+        return False
+    fields = state.split(":")
+    return fields[0] == "blocked" and "kind=permission" in fields[1:]
+
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -536,6 +566,14 @@ class KiroCliProvider(BaseProvider):
                     _dead_proc_exc,
                 )
 
+        # Check -0: Kiro OSC 7501 agent state, read from the RAW buffer before any
+        # escape stripping. If the LAST 7501 state is blocked:kind=permission,
+        # Kiro is waiting on a permission prompt. Any later 7501 state
+        # (working, done, ...) supersedes it, so only the last one counts.
+        if _is_kiro_permission_block(_last_kiro_osc_state(output)):
+            logger.debug("get_status: returning WAITING_USER_ANSWER (OSC 7501 permission)")
+            return TerminalStatus.WAITING_USER_ANSWER
+
         # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
         # cursor-movement sequences are intentionally preserved: the permission
         # check below counts idle prompts per "\n"-delimited line and relies on
@@ -549,6 +587,27 @@ class KiroCliProvider(BaseProvider):
         new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
         has_idle_prompt = old_idle_matches[0] if old_idle_matches else None
         has_new_tui_idle = bool(new_tui_idle_matches)
+
+        # Check 0c: Active TUI permission menu (Yes / Trust / No) mid-turn. The
+        # menu replaces the input box, so no idle placeholder sits below it and
+        # the PROCESSING returns below (init spinner, "Kiro is working" with no
+        # idle after it, no idle prompt at all) would otherwise win. Anchored to
+        # the bottom PERMISSION_BOTTOM_LINES lines so a menu in scrollback can't
+        # fire. A 7501 sequence after the menu means Kiro moved on (a later
+        # blocked state already returned at Check -0), so skip. SGR stripping
+        # leaves OSC sequences intact, so searching clean_output is safe here.
+        perm_lines = clean_output.split("\n")
+        perm_bottom = "\n".join(perm_lines[-PERMISSION_BOTTOM_LINES:])
+        tui_perm_bottom = list(re.finditer(TUI_PERMISSION_PATTERN, perm_bottom))
+        if tui_perm_bottom:
+            after_menu = perm_bottom[tui_perm_bottom[-1].end() :]
+            if not (
+                re.search(self._idle_prompt_pattern, after_menu)
+                or re.search(NEW_TUI_IDLE_PATTERN, after_menu)
+                or KIRO_OSC_STATE_PATTERN.search(after_menu)
+            ):
+                logger.debug("get_status: returning WAITING_USER_ANSWER (TUI permission menu)")
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check 0b: TUI startup — Kiro emits "● Initializing..." or
         # "0 of N mcp servers initialized. ctrl-c to start chatting now"
